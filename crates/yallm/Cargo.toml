@@ -1,0 +1,17 @@
+[package]
+name = "yallm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Unified LLM API converter - proxy server"
+keywords = ["llm", "openai", "anthropic", "ollama", "proxy"]
+categories = ["command-line-utilities", "api-bindings"]
+
+[[bin]]
+name = "yallm"
+path = "src/main.rs"
+
+[dependencies]
+yallm-cli.workspace = true
+tokio.workspace = true

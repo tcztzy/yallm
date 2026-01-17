@@ -1,0 +1,22 @@
+[package]
+name = "yallm-openai"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "OpenAI API support for yallm"
+keywords = ["llm", "openai", "api"]
+categories = ["api-bindings"]
+
+[dependencies]
+yallm-ir.workspace = true
+yallm-macros.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+regress = "0.10"
+
+[dev-dependencies]
+serde_yaml_ng = "0.10"
+reqwest = { version = "0.12", features = ["blocking"] }
+regex = "1"

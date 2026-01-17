@@ -1,0 +1,14 @@
+[package]
+name = "yallm-anthropic"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Anthropic API support for yallm"
+keywords = ["llm", "anthropic", "claude", "api"]
+categories = ["api-bindings"]
+
+[dependencies]
+yallm-ir.workspace = true
+serde.workspace = true
+serde_json.workspace = true

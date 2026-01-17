@@ -1,0 +1,45 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Tang Ziya <tcztzy@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/tcztzy/yallm"
+
+[workspace.dependencies]
+# Internal crates
+yallm-ir = { path = "crates/yallm-ir" }
+yallm-cli = { path = "crates/yallm-cli" }
+yallm-server = { path = "crates/yallm-server" }
+yallm-openai = { path = "crates/yallm-openai" }
+yallm-anthropic = { path = "crates/yallm-anthropic" }
+yallm-ollama = { path = "crates/yallm-ollama" }
+yallm-macros = { path = "crates/yallm-macros" }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server (axum)
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+
+# Utilities
+futures = "0.3"
+bytes = "1"

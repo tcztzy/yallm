@@ -1,0 +1,16 @@
+[package]
+name = "yallm-ir"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Intermediate Representation for yallm - unified LLM API converter"
+keywords = ["llm", "openai", "anthropic", "ollama", "api"]
+categories = ["api-bindings"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

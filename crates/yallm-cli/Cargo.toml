@@ -1,0 +1,17 @@
+[package]
+name = "yallm-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "CLI for yallm - unified LLM API converter"
+
+[dependencies]
+yallm-ir.workspace = true
+yallm-openai.workspace = true
+yallm-anthropic.workspace = true
+yallm-ollama.workspace = true
+clap.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
