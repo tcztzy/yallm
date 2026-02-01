@@ -231,7 +231,11 @@ impl From<&Message> for OllamaMessage {
         OllamaMessage {
             role: msg.role.as_str().to_string(),
             content: text,
-            images: if images.is_empty() { None } else { Some(images) },
+            images: if images.is_empty() {
+                None
+            } else {
+                Some(images)
+            },
             tool_calls: if tool_calls.is_empty() {
                 None
             } else {
@@ -261,7 +265,11 @@ impl From<OllamaResponse> for ChatResponse {
             choices: vec![Choice {
                 index: 0,
                 message: msg,
-                finish_reason: if resp.done { Some("stop".to_string()) } else { None },
+                finish_reason: if resp.done {
+                    Some("stop".to_string())
+                } else {
+                    None
+                },
             }],
             usage: Some(usage),
         }

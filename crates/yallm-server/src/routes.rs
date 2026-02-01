@@ -1,10 +1,6 @@
 //! Route handlers for the LLM API proxy
 
-use axum::{
-    Json,
-    http::StatusCode,
-    response::IntoResponse,
-};
+use axum::{Json, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 
 /// Health check response
@@ -28,11 +24,12 @@ pub struct ChatCompletionsRequest {
 }
 
 /// Chat completions endpoint placeholder
-pub async fn chat_completions(
-    Json(request): Json<ChatCompletionsRequest>,
-) -> impl IntoResponse {
+pub async fn chat_completions(Json(request): Json<ChatCompletionsRequest>) -> impl IntoResponse {
     // TODO: Implement actual conversion and proxying logic
-    tracing::debug!("Received chat completions request for model: {}", request.model);
+    tracing::debug!(
+        "Received chat completions request for model: {}",
+        request.model
+    );
 
     (
         StatusCode::NOT_IMPLEMENTED,
@@ -41,6 +38,6 @@ pub async fn chat_completions(
                 "message": "Chat completions endpoint not yet implemented",
                 "type": "not_implemented"
             }
-        }))
+        })),
     )
 }

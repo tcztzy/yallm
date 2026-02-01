@@ -64,9 +64,11 @@ impl From<ChatCompletionRequestMessage> for Message {
             ChatCompletionRequestMessage::ToolMessage(m) => {
                 let tool_content = match m.content {
                     ChatCompletionRequestToolMessageContent::TextContent(t) => t,
-                    ChatCompletionRequestToolMessageContent::ArrayOfContentParts(parts) => {
-                        parts.into_iter().map(|p| p.0.text).collect::<Vec<_>>().join("")
-                    }
+                    ChatCompletionRequestToolMessageContent::ArrayOfContentParts(parts) => parts
+                        .into_iter()
+                        .map(|p| p.0.text)
+                        .collect::<Vec<_>>()
+                        .join(""),
                 };
                 let content = vec![Content::ToolResult(ToolResultContent {
                     tool_call_id: m.tool_call_id,
@@ -75,7 +77,10 @@ impl From<ChatCompletionRequestMessage> for Message {
                 Message::new(Role::Tool, content).with_source(Source::OpenAI)
             }
             ChatCompletionRequestMessage::FunctionMessage(m) => {
-                let content = vec![Content::text(m.content)];
+                let content = m
+                    .content
+                    .map(|text| vec![Content::text(text)])
+                    .unwrap_or_default();
                 Message::new(Role::User, content).with_source(Source::OpenAI)
             }
         }
@@ -154,13 +159,13 @@ fn parse_assistant_content(content: ChatCompletionRequestAssistantMessageContent
 impl From<&Message> for ChatCompletionRequestMessage {
     fn from(msg: &Message) -> Self {
         match msg.role {
-            Role::System => ChatCompletionRequestMessage::SystemMessage(
-                ChatCompletionRequestSystemMessage {
+            Role::System => {
+                ChatCompletionRequestMessage::SystemMessage(ChatCompletionRequestSystemMessage {
                     content: content_to_system(msg),
                     name: None,
                     role: ChatCompletionRequestSystemMessageRole::System,
-                },
-            ),
+                })
+            }
             Role::User => {
                 ChatCompletionRequestMessage::UserMessage(ChatCompletionRequestUserMessage {
                     content: content_to_user(msg),
@@ -358,9 +363,10 @@ impl From<CreateChatCompletionResponse> for ChatResponse {
 fn response_message_to_ir(msg: ChatCompletionResponseMessage) -> Message {
     let mut content = Vec::new();
 
-    if !msg.content.is_empty() {
-        content.push(Content::text(msg.content));
-    }
+    if let Some(text) = msg.content
+        && !text.is_empty() {
+            content.push(Content::text(text));
+        }
 
     if let Some(tcs) = msg.tool_calls {
         for tc in tcs.0 {

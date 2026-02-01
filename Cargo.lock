@@ -2763,9 +2763,13 @@ dependencies = [
 name = "yallm-anthropic"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "dirs",
+ "regress",
  "serde",
  "serde_json",
  "yallm-ir",
+ "yallm-macros",
 ]
 
 [[package]]
