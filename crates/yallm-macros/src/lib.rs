@@ -333,9 +333,10 @@ fn convert_openapi_to_json_schema(value: &mut Value) {
 
             // Convert $ref paths
             if let Some(Value::String(ref_path)) = map.get_mut("$ref")
-                && ref_path.starts_with("#/components/schemas/") {
-                    *ref_path = ref_path.replace("#/components/schemas/", "#/definitions/");
-                }
+                && ref_path.starts_with("#/components/schemas/")
+            {
+                *ref_path = ref_path.replace("#/components/schemas/", "#/definitions/");
+            }
 
             // For object types with properties, identify nullable properties BEFORE simplification
             // and remove them from required
@@ -373,15 +374,16 @@ fn convert_openapi_to_json_schema(value: &mut Value) {
 
             // Remove nullable properties from required
             if !nullable_props.is_empty()
-                && let Some(Value::Array(required)) = map.get_mut("required") {
-                    required.retain(|v| {
-                        if let Value::String(s) = v {
-                            !nullable_props.contains(s)
-                        } else {
-                            true
-                        }
-                    });
-                }
+                && let Some(Value::Array(required)) = map.get_mut("required")
+            {
+                required.retain(|v| {
+                    if let Value::String(s) = v {
+                        !nullable_props.contains(s)
+                    } else {
+                        true
+                    }
+                });
+            }
 
             // Handle anyOf with null type - simplify to single type
             let replacement = if let Some(Value::Array(any_of)) = map.get("anyOf") {
@@ -605,38 +607,38 @@ fn extract_inline_type_enums(schemas: &mut Value) {
         for (type_name, schema) in schemas_map.iter() {
             if let Value::Object(obj) = schema
                 && let Some(Value::Object(props)) = obj.get("properties")
-                    && let Some(Value::Object(type_prop)) = props.get("type") {
-                        // Check if it's a single-value enum
-                        if let Some(Value::Array(enum_vals)) = type_prop.get("enum")
-                            && enum_vals.len() == 1 {
-                                // Create a unique type name
-                                let unique_type_name = format!("{}Type", type_name);
-                                modifications.push((type_name.clone(), unique_type_name.clone()));
+                && let Some(Value::Object(type_prop)) = props.get("type")
+            {
+                // Check if it's a single-value enum
+                if let Some(Value::Array(enum_vals)) = type_prop.get("enum")
+                    && enum_vals.len() == 1
+                {
+                    // Create a unique type name
+                    let unique_type_name = format!("{}Type", type_name);
+                    modifications.push((type_name.clone(), unique_type_name.clone()));
 
-                                // Create the new definition
-                                let mut new_def = type_prop.clone();
-                                new_def.insert(
-                                    "title".to_string(),
-                                    Value::String(unique_type_name.clone()),
-                                );
-                                new_definitions.insert(unique_type_name, Value::Object(new_def));
-                            }
-                    }
+                    // Create the new definition
+                    let mut new_def = type_prop.clone();
+                    new_def.insert("title".to_string(), Value::String(unique_type_name.clone()));
+                    new_definitions.insert(unique_type_name, Value::Object(new_def));
+                }
+            }
         }
 
         // Apply modifications
         for (type_name, unique_type_name) in modifications {
             if let Some(Value::Object(obj)) = schemas_map.get_mut(&type_name)
                 && let Some(Value::Object(props)) = obj.get_mut("properties")
-                    && props.contains_key("type") {
-                        // Replace inline enum with $ref
-                        props.insert(
-                            "type".to_string(),
-                            serde_json::json!({
-                                "$ref": format!("#/definitions/{}", unique_type_name)
-                            }),
-                        );
-                    }
+                && props.contains_key("type")
+            {
+                // Replace inline enum with $ref
+                props.insert(
+                    "type".to_string(),
+                    serde_json::json!({
+                        "$ref": format!("#/definitions/{}", unique_type_name)
+                    }),
+                );
+            }
         }
 
         // Add new definitions

@@ -364,9 +364,10 @@ fn response_message_to_ir(msg: ChatCompletionResponseMessage) -> Message {
     let mut content = Vec::new();
 
     if let Some(text) = msg.content
-        && !text.is_empty() {
-            content.push(Content::text(text));
-        }
+        && !text.is_empty()
+    {
+        content.push(Content::text(text));
+    }
 
     if let Some(tcs) = msg.tool_calls {
         for tc in tcs.0 {
