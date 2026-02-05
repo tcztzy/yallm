@@ -33,6 +33,8 @@ pub fn app() -> Router {
     Router::new()
         .route("/health", get(routes::health))
         .route("/v1/chat/completions", post(routes::chat_completions))
+        .route("/v1/messages", post(routes::anthropic_messages))
+        .route("/api/chat", post(routes::ollama_chat))
 }
 
 /// Run the server with the given configuration

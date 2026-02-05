@@ -37,4 +37,11 @@ python-source = "python"
 strip = true
 
 [tool.uv]
-managed = false
+managed = true
+
+[dependency-groups]
+dev = [
+    "anthropic>=0.77.1",
+    "ollama>=0.6.1",
+    "openai>=2.16.0",
+]

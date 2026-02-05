@@ -15,8 +15,9 @@ What exists today:
   (`crates/yallm-openai`, `crates/yallm-anthropic`, `crates/yallm-ollama`).
 - OpenAPI-driven type generation via a proc-macro (`crates/yallm-macros`) for providers that ship
   OpenAPI specs.
-- An axum server crate (`crates/yallm-server`) and a CLI crate (`crates/yallm-cli`), but the proxying
-  routes are not implemented yet (endpoints currently return `501 Not Implemented`).
+- An axum server crate (`crates/yallm-server`) and a CLI crate (`crates/yallm-cli`).
+- Compatibility endpoints exist and are validated with official Python SDKs, but they currently run
+  in **mock mode** (no real upstream provider proxying yet).
 
 ## Project Goals
 
@@ -30,9 +31,9 @@ What exists today:
 
 ## Repository Layout
 
-- `crates/yallm`: top-level binary (currently a placeholder that does not start the server yet)
+- `crates/yallm`: top-level binary (starts the HTTP server)
 - `crates/yallm-cli`: CLI argument parsing
-- `crates/yallm-server`: axum HTTP server (routes currently stubbed)
+- `crates/yallm-server`: axum HTTP server (compat endpoints; mock backend for now)
 - `crates/yallm-ir`: intermediate representation (IR) used for conversions
 - `crates/yallm-openai`: OpenAI types + conversions (generated from OpenAPI + hand-written mapping)
 - `crates/yallm-anthropic`: Anthropic types + conversions (generated from vendored OpenAPI spec)
@@ -58,6 +59,21 @@ cargo fmt
 cargo clippy --workspace --all-targets
 ```
 
+## Run The Server (Mock Mode)
+
+Start the server:
+```bash
+cargo run -p yallm -- serve --host 127.0.0.1 --port 8080
+```
+
+Compatibility endpoints:
+- OpenAI-compatible: `POST /v1/chat/completions`
+- Anthropic-compatible: `POST /v1/messages`
+- Ollama-compatible: `POST /api/chat`
+
+These currently return deterministic mock responses (useful for SDK integration tests). Wiring real
+provider proxying is on the roadmap.
+
 ## OpenAPI Type Generation
 
 Provider crates use `yallm_macros::include_openapi! { ... }` to generate Rust types from OpenAPI
@@ -67,16 +83,15 @@ Notes:
 - The macro fetches and caches specs. If your default cache directory is not writable, set
   `YALLM_CACHE_DIR` to a writable path.
 - `crates/yallm-anthropic/openapi.yml` is vendored in-repo so it can build offline. A `build.rs`
-  exists to refresh the spec opportunistically (it should fall back to the vendored file when
-  offline).
+  exists to refresh the spec, but is **opt-in** (set `YALLM_UPDATE_ANTHROPIC_OPENAPI=1`).
 - `crates/yallm-openai` can fetch its OpenAPI spec at build time if a local copy is not present. If
   you need fully offline builds, place a local spec file in the crate (see the `include_openapi!`
   config in `crates/yallm-openai/src/lib.rs`).
 
 ## Roadmap (High Level)
 
-- Implement the proxying logic in `crates/yallm-server` (routing + provider selection + streaming).
-- Wire `crates/yallm` CLI to actually start the server.
+- Implement real upstream provider proxying in `crates/yallm-server` (routing + provider selection +
+  streaming).
 - Add a provider/protocol registry to make “any provider” x “any API surface” composable.
 - Add real-world docs and examples (curl requests, streaming examples, tool-calls).
 - Add CI workflows (fmt/clippy/test).
@@ -84,4 +99,3 @@ Notes:
 ## License
 
 MIT. See `LICENSE`.
-

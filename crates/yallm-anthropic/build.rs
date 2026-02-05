@@ -10,6 +10,12 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
+    // IMPORTANT: build scripts should not mutate tracked files by default.
+    // Opt in explicitly when updating the vendored OpenAPI spec.
+    if std::env::var_os("YALLM_UPDATE_ANTHROPIC_OPENAPI").is_none() {
+        return;
+    }
+
     if let Err(e) = fetch_anthropic_openapi_spec() {
         eprintln!("Warning: Failed to fetch Anthropic OpenAPI spec: {}", e);
         eprintln!("Falling back to existing spec if available");

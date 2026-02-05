@@ -5,6 +5,7 @@
 - Build a specific crate with `cargo build -p <crate>` (e.g. `yallm-anthropic`).
 - Run binaries via `cargo run -p <crate> -- <args>` when you need CLI behavior.
 - The OpenAPI codegen macro may fetch specs at build time; set `YALLM_CACHE_DIR` if your cache directory is locked down.
+- Anthropic's vendored OpenAPI spec is only refreshed when `YALLM_UPDATE_ANTHROPIC_OPENAPI=1` is set (to avoid mutating tracked files during normal builds).
 - Workspace members live under `crates/*`; check each crate's `Cargo.toml` for names.
 
 ## Testing instructions

@@ -2,3 +2,4 @@ __pycache__/
 .coverage
 target/
 python/yallm-*.data/
+.venv/
