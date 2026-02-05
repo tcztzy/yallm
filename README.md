@@ -16,8 +16,9 @@ What exists today:
 - OpenAPI-driven type generation via a proc-macro (`crates/yallm-macros`) for providers that ship
   OpenAPI specs.
 - An axum server crate (`crates/yallm-server`) and a CLI crate (`crates/yallm-cli`).
-- Compatibility endpoints exist and are validated with official Python SDKs, but they currently run
-  in **mock mode** (no real upstream provider proxying yet).
+- Compatibility endpoints exist and are validated with official Python SDKs.
+- Real upstream provider proxying exists (OpenAI / Anthropic / Ollama), with an **auto** mode that
+  falls back to deterministic mock responses when provider configuration is missing.
 
 ## Project Goals
 
@@ -33,7 +34,7 @@ What exists today:
 
 - `crates/yallm`: top-level binary (starts the HTTP server)
 - `crates/yallm-cli`: CLI argument parsing
-- `crates/yallm-server`: axum HTTP server (compat endpoints; mock backend for now)
+- `crates/yallm-server`: axum HTTP server (compat endpoints; real proxying + mock fallback)
 - `crates/yallm-ir`: intermediate representation (IR) used for conversions
 - `crates/yallm-openai`: OpenAI types + conversions (generated from OpenAPI + hand-written mapping)
 - `crates/yallm-anthropic`: Anthropic types + conversions (generated from vendored OpenAPI spec)
@@ -72,7 +73,55 @@ Compatibility endpoints:
 - Ollama-compatible: `POST /api/chat`
 
 These currently return deterministic mock responses (useful for SDK integration tests). Wiring real
-provider proxying is on the roadmap.
+provider proxying is supported when configured (see below).
+
+## Proxying To Real Providers
+
+### Provider Selection (Model Prefix)
+
+`yallm` chooses the upstream provider from the `model` field using an openrouter/litellm-style
+prefix:
+- `openai:<model>` or `openai/<model>`
+- `anthropic:<model>` or `anthropic/<model>`
+- `ollama:<model>` or `ollama/<model>`
+
+If no prefix is present, `YALLM_DEFAULT_PROVIDER` is used (default: `openai`).
+
+The prefix is stripped before calling upstream (e.g. `anthropic:claude-3-haiku-20240307` calls
+Anthropic with model `claude-3-haiku-20240307`).
+
+### Mode
+
+`YALLM_MODE` controls behavior when provider configuration is missing:
+- `auto` (default): proxy if configured, otherwise return deterministic mock responses
+- `proxy`: always proxy (missing config returns an error)
+- `mock`: always mock (never calls upstream)
+
+### Provider Environment Variables
+
+OpenAI:
+- `OPENAI_API_KEY` (required for proxying)
+- `OPENAI_BASE_URL` (default `https://api.openai.com`)
+
+Anthropic:
+- `ANTHROPIC_API_KEY` (required for proxying)
+- `ANTHROPIC_BASE_URL` (default `https://api.anthropic.com`)
+- `ANTHROPIC_VERSION` (default `2023-06-01`)
+
+Ollama:
+- `OLLAMA_BASE_URL` (default `http://localhost:11434`)
+
+### Logging (Fluentd-Friendly JSON)
+
+`yallm` emits JSON logs to stdout using `tracing`. The server logs:
+- inbound HTTP requests (`event=http.in`)
+- outbound HTTP responses (`event=http.out`)
+- provider requests/responses (`event=provider.out` / `event=provider.in`)
+- conversion stages (`event=convert.*`)
+
+Redaction/truncation controls:
+- `YALLM_LOG_REDACT_SECRETS=1` (default): redact auth headers and common secret JSON keys
+- `YALLM_LOG_BODY_MAX_BYTES=0` (default): log full bodies; set to truncate and still log `body_len`
 
 ## OpenAPI Type Generation
 
@@ -90,8 +139,7 @@ Notes:
 
 ## Roadmap (High Level)
 
-- Implement real upstream provider proxying in `crates/yallm-server` (routing + provider selection +
-  streaming).
+- Implement streaming across all compat endpoints (currently `stream=true` returns 501).
 - Add a provider/protocol registry to make “any provider” x “any API surface” composable.
 - Add real-world docs and examples (curl requests, streaming examples, tool-calls).
 - Add CI workflows (fmt/clippy/test).

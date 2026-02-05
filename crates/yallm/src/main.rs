@@ -7,6 +7,14 @@ use yallm_server::ServerConfig;
 
 #[tokio::main]
 async fn main() {
+    // JSON logs to stdout (fluentd-friendly). Control verbosity via `RUST_LOG`.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .json()
+        .init();
+
     let cli = Cli::parse_args();
 
     let (host, port) = match cli.command {

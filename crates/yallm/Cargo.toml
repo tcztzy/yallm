@@ -16,3 +16,4 @@ path = "src/main.rs"
 yallm-cli.workspace = true
 yallm-server.workspace = true
 tokio.workspace = true
+tracing-subscriber.workspace = true
