@@ -2951,6 +2951,8 @@ name = "yallm-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",

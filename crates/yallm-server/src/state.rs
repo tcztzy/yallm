@@ -8,6 +8,9 @@ use std::{
     },
 };
 
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     OpenAI,
@@ -167,6 +170,15 @@ pub struct TransportResponse {
     pub body: Vec<u8>,
 }
 
+pub type TransportByteStream =
+    Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + Send + 'static>>;
+
+pub struct TransportStreamResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: TransportByteStream,
+}
+
 #[derive(Debug, Clone)]
 pub struct TransportError {
     pub message: String,
@@ -175,8 +187,13 @@ pub struct TransportError {
 pub type TransportFuture<'a> =
     Pin<Box<dyn Future<Output = Result<TransportResponse, TransportError>> + Send + 'a>>;
 
+pub type TransportStreamFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<TransportStreamResponse, TransportError>> + Send + 'a>>;
+
 pub trait Transport: Send + Sync {
     fn send<'a>(&'a self, req: TransportRequest) -> TransportFuture<'a>;
+
+    fn send_stream<'a>(&'a self, req: TransportRequest) -> TransportStreamFuture<'a>;
 }
 
 #[derive(Debug, Clone)]
@@ -230,6 +247,58 @@ impl Transport for ReqwestTransport {
                 status,
                 headers,
                 body: body.to_vec(),
+            })
+        })
+    }
+
+    fn send_stream<'a>(&'a self, req: TransportRequest) -> TransportStreamFuture<'a> {
+        Box::pin(async move {
+            let mut rb = match req.method {
+                "POST" => self.http.post(req.url),
+                "GET" => self.http.get(req.url),
+                "PUT" => self.http.put(req.url),
+                "DELETE" => self.http.delete(req.url),
+                _ => {
+                    return Err(TransportError {
+                        message: format!("unsupported method {}", req.method),
+                    });
+                }
+            };
+
+            for (k, v) in req.headers {
+                rb = rb.header(k, v);
+            }
+
+            let resp = rb
+                .json(&req.body)
+                .send()
+                .await
+                .map_err(|e| TransportError {
+                    message: format!("{e}"),
+                })?;
+
+            let status = resp.status().as_u16();
+            let headers = resp
+                .headers()
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.as_str().to_string(),
+                        v.to_str().unwrap_or("<non-utf8>").to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            let body = resp.bytes_stream().map(|chunk| {
+                chunk.map_err(|e| TransportError {
+                    message: format!("{e}"),
+                })
+            });
+
+            Ok(TransportStreamResponse {
+                status,
+                headers,
+                body: Box::pin(body),
             })
         })
     }

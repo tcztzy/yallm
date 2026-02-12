@@ -19,6 +19,8 @@ What exists today:
 - Compatibility endpoints exist and are validated with official Python SDKs.
 - Real upstream provider proxying exists (OpenAI / Anthropic / Ollama), with an **auto** mode that
   falls back to deterministic mock responses when provider configuration is missing.
+- `stream=true` is supported on all compat endpoints, including true upstream streaming in proxy
+  mode (with cross-provider stream translation).
 
 ## Project Goals
 
@@ -139,10 +141,11 @@ Notes:
 
 ## Roadmap (High Level)
 
-- Implement streaming across all compat endpoints (currently `stream=true` returns 501).
+- Expand streaming fidelity (tool-call deltas, finer-grained usage/finish metadata, and broader
+  protocol edge-case coverage).
 - Add a provider/protocol registry to make “any provider” x “any API surface” composable.
 - Add real-world docs and examples (curl requests, streaming examples, tool-calls).
-- Add CI workflows (fmt/clippy/test).
+- Expand CI coverage (e.g., matrix builds and additional checks).
 
 ## License
 

@@ -5,17 +5,25 @@
 //! - Anthropic-compatible: `POST /v1/messages`
 //! - Ollama-compatible: `POST /api/chat`
 
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use axum::{
+    Json,
+    body::Body,
+    extract::State,
+    http::{HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::{
     logging::RequestId,
     proxy::{
-        ProxyError, anthropic_downstream_to_ir, call_provider, choose_provider,
-        ir_to_anthropic_downstream_response, ir_to_ollama_downstream_response,
-        ir_to_openai_downstream_response, ollama_downstream_to_ir, openai_downstream_to_ir,
-        should_proxy,
+        DownstreamByteStream, DownstreamProtocol, ProxyError, anthropic_downstream_to_ir,
+        call_provider, call_provider_stream, choose_provider, ir_to_anthropic_downstream_response,
+        ir_to_anthropic_downstream_stream, ir_to_ollama_downstream_response,
+        ir_to_ollama_downstream_stream, ir_to_openai_downstream_response,
+        ir_to_openai_downstream_stream, map_provider_stream_to_downstream, ollama_downstream_to_ir,
+        openai_downstream_to_ir, should_proxy,
     },
     state::{AppState, Provider},
 };
@@ -43,21 +51,54 @@ pub async fn fallback() -> impl IntoResponse {
     )
 }
 
+fn sse_response(payload: String) -> Response {
+    let mut resp = Response::new(Body::from(payload));
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream; charset=utf-8"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+    resp
+}
+
+fn sse_stream_response(stream: DownstreamByteStream) -> Response {
+    let mut resp = Response::new(Body::from_stream(stream));
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream; charset=utf-8"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+    resp
+}
+
+fn ndjson_response(payload: String) -> Response {
+    let mut resp = Response::new(Body::from(payload));
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    resp
+}
+
+fn ndjson_stream_response(stream: DownstreamByteStream) -> Response {
+    let mut resp = Response::new(Body::from_stream(stream));
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    resp
+}
+
 pub async fn chat_completions(
     State(state): State<AppState>,
     axum::extract::Extension(RequestId(request_id)): axum::extract::Extension<RequestId>,
     Json(req): Json<Value>,
 ) -> impl IntoResponse {
-    // Always log/handle stream early (no streaming support yet).
-    if req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(json!({
-                "error": { "message": "Streaming is not implemented yet", "type": "not_implemented" }
-            })),
-        )
-            .into_response();
-    }
+    let stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let model = match req.get("model").and_then(|v| v.as_str()) {
         Some(m) => m,
@@ -107,32 +148,62 @@ pub async fn chat_completions(
     );
 
     match should_proxy(&state, provider) {
-        Ok(true) => match call_provider(&state, request_id, provider, &ir).await {
-            Ok(ir_resp) => {
-                tracing::info!(
-                    event = "convert.provider_to_ir",
-                    request_id,
-                    provider = provider.as_str()
-                );
-                let out = ir_to_openai_downstream_response(&ir_resp, &upstream_model);
-                tracing::info!(
-                    event = "convert.ir_to_downstream",
-                    request_id,
-                    downstream = "openai"
-                );
-                (StatusCode::OK, Json(out)).into_response()
+        Ok(true) => {
+            if stream {
+                match call_provider_stream(&state, request_id, provider, &ir).await {
+                    Ok(stream_resp) => {
+                        tracing::info!(
+                            event = "convert.provider_to_ir_stream",
+                            request_id,
+                            provider = provider.as_str()
+                        );
+                        let out = map_provider_stream_to_downstream(
+                            stream_resp.provider,
+                            DownstreamProtocol::OpenAI,
+                            stream_resp.body,
+                            upstream_model.clone(),
+                        );
+                        tracing::info!(
+                            event = "convert.ir_to_downstream_stream",
+                            request_id,
+                            downstream = "openai"
+                        );
+                        sse_stream_response(out)
+                    }
+                    Err(e) => proxy_error_to_response(provider, e).into_response(),
+                }
+            } else {
+                match call_provider(&state, request_id, provider, &ir).await {
+                    Ok(ir_resp) => {
+                        tracing::info!(
+                            event = "convert.provider_to_ir",
+                            request_id,
+                            provider = provider.as_str()
+                        );
+                        let out = ir_to_openai_downstream_response(&ir_resp, &upstream_model);
+                        tracing::info!(
+                            event = "convert.ir_to_downstream",
+                            request_id,
+                            downstream = "openai"
+                        );
+                        (StatusCode::OK, Json(out)).into_response()
+                    }
+                    Err(e) => proxy_error_to_response(provider, e).into_response(),
+                }
             }
-            Err(e) => proxy_error_to_response(provider, e).into_response(),
-        },
+        }
         Ok(false) => {
             // Mock fallback: deterministic response based on last user message.
             let reply = mock_reply(extract_last_user_text(&ir));
-            let out = ir_to_openai_downstream_response(
-                &mock_ir_response(&ir.model, reply),
-                &upstream_model,
-            );
+            let mock = mock_ir_response(&ir.model, reply);
             tracing::info!(event = "convert.mock", request_id, downstream = "openai");
-            (StatusCode::OK, Json(out)).into_response()
+            if stream {
+                let out = ir_to_openai_downstream_stream(&mock, &upstream_model);
+                sse_response(out)
+            } else {
+                let out = ir_to_openai_downstream_response(&mock, &upstream_model);
+                (StatusCode::OK, Json(out)).into_response()
+            }
         }
         Err(e) => proxy_error_to_response(provider, e).into_response(),
     }
@@ -143,16 +214,7 @@ pub async fn anthropic_messages(
     axum::extract::Extension(RequestId(request_id)): axum::extract::Extension<RequestId>,
     Json(req): Json<Value>,
 ) -> impl IntoResponse {
-    if req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(json!({
-                "type": "error",
-                "error": { "type": "not_implemented", "message": "Streaming is not implemented yet" }
-            })),
-        )
-            .into_response();
-    }
+    let stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let model = match req.get("model").and_then(|v| v.as_str()) {
         Some(m) => m,
@@ -202,31 +264,61 @@ pub async fn anthropic_messages(
     );
 
     match should_proxy(&state, provider) {
-        Ok(true) => match call_provider(&state, request_id, provider, &ir).await {
-            Ok(ir_resp) => {
-                tracing::info!(
-                    event = "convert.provider_to_ir",
-                    request_id,
-                    provider = provider.as_str()
-                );
-                let out = ir_to_anthropic_downstream_response(&ir_resp, &upstream_model);
-                tracing::info!(
-                    event = "convert.ir_to_downstream",
-                    request_id,
-                    downstream = "anthropic"
-                );
-                (StatusCode::OK, Json(out)).into_response()
+        Ok(true) => {
+            if stream {
+                match call_provider_stream(&state, request_id, provider, &ir).await {
+                    Ok(stream_resp) => {
+                        tracing::info!(
+                            event = "convert.provider_to_ir_stream",
+                            request_id,
+                            provider = provider.as_str()
+                        );
+                        let out = map_provider_stream_to_downstream(
+                            stream_resp.provider,
+                            DownstreamProtocol::Anthropic,
+                            stream_resp.body,
+                            upstream_model.clone(),
+                        );
+                        tracing::info!(
+                            event = "convert.ir_to_downstream_stream",
+                            request_id,
+                            downstream = "anthropic"
+                        );
+                        sse_stream_response(out)
+                    }
+                    Err(e) => proxy_error_to_response(provider, e).into_response(),
+                }
+            } else {
+                match call_provider(&state, request_id, provider, &ir).await {
+                    Ok(ir_resp) => {
+                        tracing::info!(
+                            event = "convert.provider_to_ir",
+                            request_id,
+                            provider = provider.as_str()
+                        );
+                        let out = ir_to_anthropic_downstream_response(&ir_resp, &upstream_model);
+                        tracing::info!(
+                            event = "convert.ir_to_downstream",
+                            request_id,
+                            downstream = "anthropic"
+                        );
+                        (StatusCode::OK, Json(out)).into_response()
+                    }
+                    Err(e) => proxy_error_to_response(provider, e).into_response(),
+                }
             }
-            Err(e) => proxy_error_to_response(provider, e).into_response(),
-        },
+        }
         Ok(false) => {
             let reply = mock_reply(extract_last_user_text(&ir));
-            let out = ir_to_anthropic_downstream_response(
-                &mock_ir_response(&ir.model, reply),
-                &upstream_model,
-            );
+            let mock = mock_ir_response(&ir.model, reply);
             tracing::info!(event = "convert.mock", request_id, downstream = "anthropic");
-            (StatusCode::OK, Json(out)).into_response()
+            if stream {
+                let out = ir_to_anthropic_downstream_stream(&mock, &upstream_model);
+                sse_response(out)
+            } else {
+                let out = ir_to_anthropic_downstream_response(&mock, &upstream_model);
+                (StatusCode::OK, Json(out)).into_response()
+            }
         }
         Err(e) => proxy_error_to_response(provider, e).into_response(),
     }
@@ -237,13 +329,7 @@ pub async fn ollama_chat(
     axum::extract::Extension(RequestId(request_id)): axum::extract::Extension<RequestId>,
     Json(req): Json<Value>,
 ) -> impl IntoResponse {
-    if req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(json!({ "error": "Streaming is not implemented yet" })),
-        )
-            .into_response();
-    }
+    let stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let model = match req.get("model").and_then(|v| v.as_str()) {
         Some(m) => m,
@@ -293,31 +379,61 @@ pub async fn ollama_chat(
     );
 
     match should_proxy(&state, provider) {
-        Ok(true) => match call_provider(&state, request_id, provider, &ir).await {
-            Ok(ir_resp) => {
-                tracing::info!(
-                    event = "convert.provider_to_ir",
-                    request_id,
-                    provider = provider.as_str()
-                );
-                let out = ir_to_ollama_downstream_response(&ir_resp, &upstream_model);
-                tracing::info!(
-                    event = "convert.ir_to_downstream",
-                    request_id,
-                    downstream = "ollama"
-                );
-                (StatusCode::OK, Json(out)).into_response()
+        Ok(true) => {
+            if stream {
+                match call_provider_stream(&state, request_id, provider, &ir).await {
+                    Ok(stream_resp) => {
+                        tracing::info!(
+                            event = "convert.provider_to_ir_stream",
+                            request_id,
+                            provider = provider.as_str()
+                        );
+                        let out = map_provider_stream_to_downstream(
+                            stream_resp.provider,
+                            DownstreamProtocol::Ollama,
+                            stream_resp.body,
+                            upstream_model.clone(),
+                        );
+                        tracing::info!(
+                            event = "convert.ir_to_downstream_stream",
+                            request_id,
+                            downstream = "ollama"
+                        );
+                        ndjson_stream_response(out)
+                    }
+                    Err(e) => proxy_error_to_response(provider, e).into_response(),
+                }
+            } else {
+                match call_provider(&state, request_id, provider, &ir).await {
+                    Ok(ir_resp) => {
+                        tracing::info!(
+                            event = "convert.provider_to_ir",
+                            request_id,
+                            provider = provider.as_str()
+                        );
+                        let out = ir_to_ollama_downstream_response(&ir_resp, &upstream_model);
+                        tracing::info!(
+                            event = "convert.ir_to_downstream",
+                            request_id,
+                            downstream = "ollama"
+                        );
+                        (StatusCode::OK, Json(out)).into_response()
+                    }
+                    Err(e) => proxy_error_to_response(provider, e).into_response(),
+                }
             }
-            Err(e) => proxy_error_to_response(provider, e).into_response(),
-        },
+        }
         Ok(false) => {
             let reply = mock_reply(extract_last_user_text(&ir));
-            let out = ir_to_ollama_downstream_response(
-                &mock_ir_response(&ir.model, reply),
-                &upstream_model,
-            );
+            let mock = mock_ir_response(&ir.model, reply);
             tracing::info!(event = "convert.mock", request_id, downstream = "ollama");
-            (StatusCode::OK, Json(out)).into_response()
+            if stream {
+                let out = ir_to_ollama_downstream_stream(&mock, &upstream_model);
+                ndjson_response(out)
+            } else {
+                let out = ir_to_ollama_downstream_response(&mock, &upstream_model);
+                (StatusCode::OK, Json(out)).into_response()
+            }
         }
         Err(e) => proxy_error_to_response(provider, e).into_response(),
     }

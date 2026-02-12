@@ -59,6 +59,40 @@ async fn openai_chat_completions_ok() {
 }
 
 #[tokio::test]
+async fn openai_chat_completions_stream_ok() {
+    let payload = serde_json::json!({
+        "model": "gpt-4o-mini",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hello"}],
+    });
+
+    let resp = app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(content_type.starts_with("text/event-stream"));
+
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("\"chat.completion.chunk\""));
+    assert!(text.contains("data: [DONE]"));
+}
+
+#[tokio::test]
 async fn anthropic_messages_ok() {
     let payload = serde_json::json!({
         "model": "claude-3-haiku-20240307",
@@ -92,6 +126,42 @@ async fn anthropic_messages_ok() {
 }
 
 #[tokio::test]
+async fn anthropic_messages_stream_ok() {
+    let payload = serde_json::json!({
+        "model": "claude-3-haiku-20240307",
+        "stream": true,
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hello"}],
+    });
+
+    let resp = app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(content_type.starts_with("text/event-stream"));
+
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("event: message_start"));
+    assert!(text.contains("event: message_delta"));
+    assert!(text.contains("event: message_stop"));
+}
+
+#[tokio::test]
 async fn ollama_chat_ok() {
     let payload = serde_json::json!({
         "model": "llama3",
@@ -117,4 +187,46 @@ async fn ollama_chat_ok() {
     assert_eq!(v["model"], "llama3");
     assert_eq!(v["message"]["role"], "assistant");
     assert_eq!(v["done"], true);
+}
+
+#[tokio::test]
+async fn ollama_chat_stream_ok() {
+    let payload = serde_json::json!({
+        "model": "llama3",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hello"}],
+    });
+
+    let resp = app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/chat")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(content_type, "application/x-ndjson");
+
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+
+    assert!(lines.len() >= 2);
+    let first: serde_json::Value = serde_json::from_str(lines.first().unwrap()).unwrap();
+    let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+    assert_eq!(first["done"], false);
+    assert_eq!(last["done"], true);
 }
