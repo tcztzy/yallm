@@ -139,6 +139,29 @@ Notes:
   you need fully offline builds, place a local spec file in the crate (see the `include_openapi!`
   config in `crates/yallm-openai/src/lib.rs`).
 
+### Deterministic Offline Build Recipe
+
+To make builds reproducible and offline-friendly:
+
+1. Prefetch dependencies once:
+   ```bash
+   cargo fetch --locked
+   ```
+2. Keep vendored specs pinned (do not refresh Anthropic during normal builds):
+   ```bash
+   export YALLM_UPDATE_ANTHROPIC_OPENAPI=0
+   ```
+3. Build/test in offline mode:
+   ```bash
+   export CARGO_NET_OFFLINE=true
+   cargo check --workspace --locked
+   cargo test --workspace --locked
+   ```
+4. (Optional guard) verify vendored Anthropic spec was not mutated:
+   ```bash
+   git diff --exit-code -- crates/yallm-anthropic/openapi.yml
+   ```
+
 ## Roadmap (High Level)
 
 - Expand streaming fidelity (tool-call deltas, finer-grained usage/finish metadata, and broader

@@ -27,8 +27,8 @@ pub use MessageStreamEvent as AnthropicStreamEvent;
 
 use yallm_ir::{
     ChatRequest, ChatResponse, Choice, ChoiceDelta, Content as IrContent, DeltaContent,
-    Message as IrMessage, Role as IrRole, Source as IrSource, StreamChunk, TextDelta,
-    ToolCallContent, ToolCallDelta, Usage as IrUsage,
+    ImageContent, ImageSourceType, Message as IrMessage, Role as IrRole, Source as IrSource,
+    StreamChunk, TextDelta, ToolCallContent, ToolCallDelta, ToolResultContent, Usage as IrUsage,
 };
 
 // ============================================================================
@@ -54,23 +54,23 @@ impl From<CreateMessageParams> for ChatRequest {
             }
         }
 
-        // Convert messages - simplified, just extract text content
+        // Convert messages, preserving structured blocks where possible.
         for msg in req.messages {
             let role = match msg.role {
                 Role::User => IrRole::User,
                 Role::Assistant => IrRole::Assistant,
             };
 
-            let text = match msg.content {
-                Content::String(s) => s,
-                Content::ContentBlockSourceContent(_) => {
-                    // TODO: Handle complex content blocks
-                    String::new()
-                }
+            let content = match msg.content {
+                Content::String(s) => vec![IrContent::text(s)],
+                Content::ContentBlockSourceContent(blocks) => blocks
+                    .into_iter()
+                    .flat_map(parse_input_content_block)
+                    .collect(),
             };
 
-            if !text.is_empty() {
-                messages.push(IrMessage::text(role, text).with_source(IrSource::Anthropic));
+            if !content.is_empty() {
+                messages.push(IrMessage::new(role, content).with_source(IrSource::Anthropic));
             }
         }
 
@@ -83,6 +83,119 @@ impl From<CreateMessageParams> for ChatRequest {
             stream: req.stream.unwrap_or(false),
         }
     }
+}
+
+fn parse_input_content_block(block: ContentBlockSourceContentItem) -> Vec<IrContent> {
+    let value = match serde_json::to_value(block) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let Some(kind) = value.get("type").and_then(|v| v.as_str()) else {
+        return Vec::new();
+    };
+
+    match kind {
+        "text" => value
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(|text| vec![IrContent::text(text)])
+            .unwrap_or_default(),
+        "image" => parse_image_content(&value)
+            .map(|img| vec![IrContent::Image(img)])
+            .unwrap_or_default(),
+        "tool_use" | "server_tool_use" => parse_tool_call_content(&value)
+            .map(|tool| vec![IrContent::ToolCall(tool)])
+            .unwrap_or_default(),
+        "tool_result" => parse_tool_result_content(&value)
+            .map(|result| vec![IrContent::ToolResult(result)])
+            .unwrap_or_default(),
+        "thinking" => value
+            .get("thinking")
+            .and_then(|v| v.as_str())
+            .map(|text| vec![IrContent::text(text)])
+            .unwrap_or_default(),
+        "redacted_thinking" => value
+            .get("data")
+            .and_then(|v| v.as_str())
+            .map(|text| vec![IrContent::text(text)])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn parse_image_content(value: &serde_json::Value) -> Option<ImageContent> {
+    let source = value.get("source")?;
+    let source_type = source.get("type")?.as_str()?;
+    match source_type {
+        "base64" => Some(ImageContent {
+            source_type: ImageSourceType::Base64,
+            media_type: source.get("media_type")?.as_str()?.to_string(),
+            data: source.get("data")?.as_str()?.to_string(),
+        }),
+        "url" => Some(ImageContent {
+            source_type: ImageSourceType::Url,
+            media_type: String::new(),
+            data: source.get("url")?.as_str()?.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+fn parse_tool_call_content(value: &serde_json::Value) -> Option<ToolCallContent> {
+    let id = value.get("id")?.as_str()?.to_string();
+    let name = value.get("name")?.as_str()?.to_string();
+    let arguments = value
+        .get("input")
+        .map(serialize_json_string)
+        .unwrap_or_else(|| "{}".to_string());
+
+    Some(ToolCallContent {
+        id,
+        name,
+        arguments,
+    })
+}
+
+fn parse_tool_result_content(value: &serde_json::Value) -> Option<ToolResultContent> {
+    let tool_call_id = value.get("tool_use_id")?.as_str()?.to_string();
+    let content = match value.get("content") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(extract_text_from_block_value)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(other) => serialize_json_string(other),
+        None => String::new(),
+    };
+
+    Some(ToolResultContent {
+        tool_call_id,
+        content,
+    })
+}
+
+fn extract_text_from_block_value(value: &serde_json::Value) -> Option<String> {
+    match value.get("type").and_then(|v| v.as_str()) {
+        Some("text") => value
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+        Some("thinking") => value
+            .get("thinking")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+        Some("redacted_thinking") => value
+            .get("data")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+        _ => None,
+    }
+}
+
+fn serialize_json_string(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
 }
 
 // ============================================================================
@@ -434,6 +547,82 @@ mod tests {
                 assert!(tc.arguments.contains("San Francisco"));
             }
             _ => panic!("Expected ToolCall content"),
+        }
+    }
+
+    #[test]
+    fn test_convert_create_message_params_with_structured_content_blocks() {
+        let json = r#"{
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "AAAA"
+                            }
+                        }
+                    ]
+                }
+            ]
+        }"#;
+
+        let params: CreateMessageParams = serde_json::from_str(json).unwrap();
+        let chat_request: ChatRequest = params.into();
+        assert_eq!(chat_request.messages.len(), 1);
+        assert_eq!(chat_request.messages[0].content.len(), 2);
+
+        match &chat_request.messages[0].content[0] {
+            IrContent::Text(t) => assert_eq!(t.text, "Describe this image"),
+            _ => panic!("Expected Text content"),
+        }
+        match &chat_request.messages[0].content[1] {
+            IrContent::Image(i) => {
+                assert_eq!(i.source_type, ImageSourceType::Base64);
+                assert_eq!(i.media_type, "image/png");
+                assert_eq!(i.data, "AAAA");
+            }
+            _ => panic!("Expected Image content"),
+        }
+    }
+
+    #[test]
+    fn test_convert_create_message_params_with_url_image_block() {
+        let json = r#"{
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "url",
+                                "url": "https://example.com/cat.png"
+                            }
+                        }
+                    ]
+                }
+            ]
+        }"#;
+
+        let params: CreateMessageParams = serde_json::from_str(json).unwrap();
+        let chat_request: ChatRequest = params.into();
+        assert_eq!(chat_request.messages.len(), 1);
+        assert_eq!(chat_request.messages[0].content.len(), 1);
+        match &chat_request.messages[0].content[0] {
+            IrContent::Image(i) => {
+                assert_eq!(i.source_type, ImageSourceType::Url);
+                assert_eq!(i.data, "https://example.com/cat.png");
+            }
+            _ => panic!("Expected Image content"),
         }
     }
 

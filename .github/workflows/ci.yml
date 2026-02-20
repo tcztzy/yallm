@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            toolchain: stable
+            run_quality: true
+            run_perf: true
+          - os: ubuntu-latest
+            toolchain: beta
+            run_quality: false
+            run_perf: false
+          - os: macos-latest
+            toolchain: stable
+            run_quality: false
+            run_perf: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        if: ${{ matrix.run_quality }}
+        run: cargo fmt -- --check
+
+      - name: Lint
+        if: ${{ matrix.run_quality }}
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Perf guardrails
+        if: ${{ matrix.run_perf }}
+        env:
+          YALLM_BUDGET_OPENAI_TO_IR_NS: "50000"
+          YALLM_BUDGET_IR_TO_OPENAI_NS: "80000"
+        run: cargo test -p yallm-server --release --test perf_guardrail -- --ignored
+
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Prefetch dependencies
+        run: cargo fetch --locked
+
+      - name: Offline workspace check
+        env:
+          CARGO_NET_OFFLINE: "true"
+          YALLM_UPDATE_ANTHROPIC_OPENAPI: "0"
+        run: cargo check --workspace --locked
+
+      - name: Verify vendored Anthropic spec is unchanged
+        env:
+          YALLM_UPDATE_ANTHROPIC_OPENAPI: "0"
+        run: |
+          cargo build -p yallm-anthropic --locked
+          git diff --exit-code -- crates/yallm-anthropic/openapi.yml
