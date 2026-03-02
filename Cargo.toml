@@ -15,9 +15,12 @@ yallm-ir = { path = "crates/yallm-ir" }
 yallm-cli = { path = "crates/yallm-cli" }
 yallm-server = { path = "crates/yallm-server" }
 yallm-openai = { path = "crates/yallm-openai" }
+yallm-openai-responses = { path = "crates/yallm-openai-responses" }
 yallm-anthropic = { path = "crates/yallm-anthropic" }
 yallm-ollama = { path = "crates/yallm-ollama" }
 yallm-macros = { path = "crates/yallm-macros" }
+yallm-responses = { path = "crates/yallm-responses" }
+yallm-storage = { path = "crates/yallm-storage" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

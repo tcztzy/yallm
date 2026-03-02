@@ -1,6 +1,7 @@
 use std::{
     env,
     future::Future,
+    path::PathBuf,
     pin::Pin,
     sync::{
         Arc,
@@ -56,6 +57,7 @@ pub struct ProviderConfig {
 #[derive(Clone)]
 pub struct AppState {
     pub transport: Arc<dyn Transport>,
+    pub store: Arc<yallm_storage::LocalStore>,
     pub provider: ProviderConfig,
     pub mode: Mode,
     pub default_provider: Provider,
@@ -137,6 +139,13 @@ impl Default for AppState {
             body_max_bytes: env_usize("YALLM_LOG_BODY_MAX_BYTES", 0),
         };
 
+        let storage_path = env::var(yallm_storage::STORAGE_PATH_ENV)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        let store = yallm_storage::LocalStore::open_sync(storage_path)
+            .expect("failed to open local yallm storage");
+
         // Avoid consulting OS proxy configuration (which can require platform APIs that
         // aren't always available in sandboxed/test environments).
         let http = reqwest::Client::builder()
@@ -146,6 +155,7 @@ impl Default for AppState {
 
         AppState {
             transport: Arc::new(ReqwestTransport { http }),
+            store: Arc::new(store),
             provider,
             mode,
             default_provider,

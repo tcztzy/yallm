@@ -39,6 +39,8 @@ What exists today:
 - `crates/yallm-server`: axum HTTP server (compat endpoints; real proxying + mock fallback)
 - `crates/yallm-ir`: intermediate representation (IR) used for conversions
 - `crates/yallm-openai`: OpenAI types + conversions (generated from OpenAPI + hand-written mapping)
+- `crates/yallm-responses`: OpenAI Responses/Conversations types + IR mapping helpers
+- `crates/yallm-storage`: local JSON storage for responses/conversations history
 - `crates/yallm-anthropic`: Anthropic types + conversions (generated from vendored OpenAPI spec)
 - `crates/yallm-ollama`: Ollama types + conversions
 - `crates/yallm-macros`: `include_openapi!` proc macro for compile-time type generation
@@ -71,11 +73,15 @@ cargo run -p yallm -- serve --host 127.0.0.1 --port 8080
 
 Compatibility endpoints:
 - OpenAI-compatible: `POST /v1/chat/completions`
+- OpenAI Responses-compatible: `POST /v1/responses`
+- OpenAI Conversations-compatible: `POST /v1/conversations`
 - Anthropic-compatible: `POST /v1/messages`
 - Ollama-compatible: `POST /api/chat`
 
 These currently return deterministic mock responses (useful for SDK integration tests). Wiring real
 provider proxying is supported when configured (see below).
+
+Responses/conversations state is stored locally so history can continue across provider switches.
 
 ## Proxying To Real Providers
 
@@ -112,6 +118,9 @@ Anthropic:
 
 Ollama:
 - `OLLAMA_BASE_URL` (default `http://localhost:11434`)
+
+Local storage:
+- `YALLM_STORAGE_PATH` (optional): local JSON file path for persisted responses/conversations history.
 
 ### Logging (Fluentd-Friendly JSON)
 
