@@ -118,6 +118,19 @@ impl yallm_server::Transport for MockTransport {
                     .get("model")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
+                let last_user = req
+                    .body
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .and_then(|messages| {
+                        messages
+                            .iter()
+                            .rev()
+                            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+                    })
+                    .and_then(|m| m.get("content"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("hello");
                 let body = json!({
                     "id": "chatcmpl_test",
                     "object": "chat.completion",
@@ -125,7 +138,7 @@ impl yallm_server::Transport for MockTransport {
                     "model": model,
                     "choices": [{
                         "index": 0,
-                        "message": {"role": "assistant", "content": "hello from chat"},
+                        "message": {"role": "assistant", "content": format!("hello from chat: {last_user}")},
                         "finish_reason": "stop"
                     }],
                     "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
@@ -143,12 +156,25 @@ impl yallm_server::Transport for MockTransport {
                     .get("model")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
+                let last_user = req
+                    .body
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .and_then(|messages| {
+                        messages
+                            .iter()
+                            .rev()
+                            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+                    })
+                    .and_then(|m| m.get("content"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("hello");
                 let body = json!({
                     "id": "msg_test",
                     "type": "message",
                     "role": "assistant",
                     "model": model,
-                    "content": [{"type":"text","text":"hello from anthropic"}],
+                    "content": [{"type":"text","text": format!("hello from anthropic: {last_user}")}],
                     "stop_reason": "end_turn",
                     "stop_sequence": null,
                     "usage": {"input_tokens": 3, "output_tokens": 4}
@@ -347,6 +373,154 @@ async fn followup_with_previous_response_id_continues_history() {
     assert_eq!(status, StatusCode::OK);
     assert!(second["previous_response_id"].is_string());
     assert!(second["conversation"]["id"].is_string());
+}
+
+#[tokio::test]
+async fn multi_turn_responses_use_chat_completions_upstream() {
+    let capture = Arc::new(Capture::default());
+    let app = app("chat-completions-upstream", capture.clone());
+
+    let (status, conv) = post_json(
+        &app,
+        "/v1/conversations",
+        json!({"metadata":{"topic":"chat-completions-multiturn"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let conv_id = conv["id"].as_str().unwrap().to_string();
+
+    let (status, first) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model":"openai:gpt-4o-mini",
+            "conversation":{"id": conv_id},
+            "input":"turn-1"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        first["output"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap_or(""),
+        "hello from chat: turn-1"
+    );
+
+    let (status, second) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model":"openai:gpt-4o-mini",
+            "conversation":{"id": conv_id},
+            "input":"turn-2"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        second["output"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap_or(""),
+        "hello from chat: turn-2"
+    );
+
+    let requests = capture.requests.lock().await;
+    assert!(!requests.iter().any(|r| r.url.ends_with("/v1/responses")));
+
+    let chat_requests: Vec<_> = requests
+        .iter()
+        .filter(|r| r.url.ends_with("/v1/chat/completions"))
+        .collect();
+    assert_eq!(chat_requests.len(), 2);
+
+    let first_messages = chat_requests[0]
+        .body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let second_messages = chat_requests[1]
+        .body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert!(second_messages > first_messages);
+}
+
+#[tokio::test]
+async fn multi_turn_responses_use_anthropic_upstream() {
+    let capture = Arc::new(Capture::default());
+    let app = app("anthropic-upstream", capture.clone());
+
+    let (status, conv) = post_json(
+        &app,
+        "/v1/conversations",
+        json!({"metadata":{"topic":"anthropic-multiturn"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let conv_id = conv["id"].as_str().unwrap().to_string();
+
+    let (status, first) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model":"anthropic:claude-3-haiku-20240307",
+            "conversation":{"id": conv_id},
+            "input":"turn-a1"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        first["output"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap_or(""),
+        "hello from anthropic: turn-a1"
+    );
+
+    let (status, second) = post_json(
+        &app,
+        "/v1/responses",
+        json!({
+            "model":"anthropic:claude-3-haiku-20240307",
+            "conversation":{"id": conv_id},
+            "input":"turn-a2"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        second["output"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap_or(""),
+        "hello from anthropic: turn-a2"
+    );
+
+    let requests = capture.requests.lock().await;
+    assert!(!requests.iter().any(|r| r.url.ends_with("/v1/responses")));
+
+    let anthropic_requests: Vec<_> = requests
+        .iter()
+        .filter(|r| r.url.ends_with("/v1/messages"))
+        .collect();
+    assert_eq!(anthropic_requests.len(), 2);
+
+    let first_messages = anthropic_requests[0]
+        .body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let second_messages = anthropic_requests[1]
+        .body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert!(second_messages > first_messages);
 }
 
 #[tokio::test]
