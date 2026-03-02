@@ -10,7 +10,6 @@ description = "HTTP server for yallm LLM API conversion proxy"
 [dependencies]
 yallm-ir.workspace = true
 yallm-openai.workspace = true
-yallm-openai-responses.workspace = true
 yallm-anthropic.workspace = true
 yallm-ollama.workspace = true
 yallm-responses.workspace = true
