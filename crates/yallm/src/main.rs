@@ -17,17 +17,41 @@ async fn main() {
 
     let cli = Cli::parse_args();
 
-    let (host, port) = match cli.command {
-        Some(Commands::Serve { port, host }) => (host, port),
-        None => (cli.host, cli.port),
+    let (host, port, tls_cert, tls_key, litellm_config) = match cli.command {
+        Some(Commands::Serve {
+            port,
+            host,
+            tls_cert,
+            tls_key,
+            litellm_config,
+        }) => (host, port, tls_cert, tls_key, litellm_config),
+        None => (
+            cli.host,
+            cli.port,
+            cli.tls_cert,
+            cli.tls_key,
+            cli.litellm_config,
+        ),
     };
 
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
         .expect("invalid host/port combination");
 
-    println!("Starting yallm proxy server on {addr}");
-    if let Err(e) = yallm_server::run(ServerConfig { addr }).await {
+    let scheme = if tls_cert.is_some() && tls_key.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    println!("Starting yallm proxy server on {scheme}://{addr}");
+    if let Err(e) = yallm_server::run(ServerConfig {
+        addr,
+        tls_cert,
+        tls_key,
+        litellm_config,
+    })
+    .await
+    {
         eprintln!("Server error: {e}");
         std::process::exit(1);
     }

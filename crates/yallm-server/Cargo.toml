@@ -14,6 +14,7 @@ yallm-anthropic.workspace = true
 yallm-ollama.workspace = true
 yallm-responses.workspace = true
 yallm-storage.workspace = true
+yallm-config.workspace = true
 
 axum.workspace = true
 tokio.workspace = true
@@ -25,6 +26,9 @@ tracing.workspace = true
 reqwest.workspace = true
 bytes.workspace = true
 futures.workspace = true
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
 
 [dev-dependencies]
 criterion = "0.5"

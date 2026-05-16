@@ -7,32 +7,47 @@ use axum::{
     Router,
     routing::{get, post},
 };
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf};
 use tokio::net::TcpListener;
+use tower_http::cors::{Any, CorsLayer};
 
 mod logging;
 mod proxy;
 mod responses_routes;
 mod routes;
 mod state;
+mod tls;
 
 pub use logging::*;
 pub use proxy::*;
 pub use responses_routes::*;
 pub use routes::*;
 pub use state::*;
+pub use tls::*;
 
 /// Server configuration
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub addr: SocketAddr,
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    pub litellm_config: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            addr: SocketAddr::from(([127, 0, 0, 1], 8080)),
+            addr: SocketAddr::from(([127, 0, 0, 1], 4000)),
+            tls_cert: None,
+            tls_key: None,
+            litellm_config: None,
         }
+    }
+}
+
+impl ServerConfig {
+    pub fn tls_enabled(&self) -> bool {
+        self.tls_cert.is_some() && self.tls_key.is_some()
     }
 }
 
@@ -44,7 +59,9 @@ pub fn app() -> Router {
 /// Create the application router with a provided state (useful for tests).
 pub fn app_with_state(state: AppState) -> Router {
     Router::new()
+        .route("/", get(routes::root))
         .route("/health", get(routes::health))
+        .route("/v1/models", get(routes::models_list))
         .route("/v1/chat/completions", post(routes::chat_completions))
         .route("/v1/messages", post(routes::anthropic_messages))
         .route("/api/chat", post(routes::ollama_chat))
@@ -90,6 +107,12 @@ pub fn app_with_state(state: AppState) -> Router {
                 .delete(responses_routes::conversation_item_delete),
         )
         .fallback(routes::fallback)
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             logging::log_http,
@@ -99,8 +122,42 @@ pub fn app_with_state(state: AppState) -> Router {
 
 /// Run the server with the given configuration
 pub async fn run(config: ServerConfig) -> std::io::Result<()> {
-    let app = app();
-    let listener = TcpListener::bind(config.addr).await?;
-    tracing::info!("Server listening on {}", config.addr);
-    axum::serve(listener, app).await
+    // Reject partial TLS config; silent HTTP fallback is a footgun in prod.
+    match (config.tls_cert.as_deref(), config.tls_key.as_deref()) {
+        (Some(_), None) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--tls-cert was set but --tls-key was not; both are required for HTTPS",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--tls-key was set but --tls-cert was not; both are required for HTTPS",
+            ));
+        }
+        _ => {}
+    }
+
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+    let loaded_config = yallm_config::load_with_options(yallm_config::LoadOptions {
+        litellm_config: config.litellm_config.clone(),
+    });
+    let app = app_with_state(AppState::from_loaded_config(loaded_config));
+    let addr = config.addr;
+
+    if config.tls_enabled() {
+        let cert = config.tls_cert.as_ref().unwrap();
+        let key = config.tls_key.as_ref().unwrap();
+        let acceptor = tls_acceptor(cert, key)?;
+        let listener = TlsListener::bind(addr, acceptor).await?;
+        tracing::info!("Server listening on https://{addr}");
+        axum::serve(listener, app).await
+    } else {
+        let listener = TcpListener::bind(addr).await?;
+        tracing::info!("Server listening on http://{addr}");
+        axum::serve(listener, app).await
+    }
 }

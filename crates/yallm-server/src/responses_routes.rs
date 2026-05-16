@@ -11,7 +11,10 @@ use yallm_storage::{ListOrder, SaveResponseRequest, StoreError};
 
 use crate::{
     logging::RequestId,
-    proxy::{ProxyError, call_provider, choose_provider, should_proxy},
+    proxy::{
+        ProviderTarget, ProxyError, call_provider, choose_provider, normalized_openai_url,
+        openai_api_key, should_proxy,
+    },
     state::{AppState, Provider, TransportRequest},
 };
 
@@ -54,18 +57,20 @@ pub async fn responses_create(
         Err(err) => return store_error_to_response(err),
     };
 
-    let (provider, _downstream_model, upstream_model) = choose_provider(&state, model);
+    let target = choose_provider(&state, model);
+    let provider = target.provider;
+    let upstream_model = target.upstream_model.clone();
     let should_openai_passthrough = provider == Provider::OpenAI
         && conversation_id.is_none()
         && previous_response_id.is_none()
         && context.items.is_empty();
 
-    if should_openai_passthrough && matches!(should_proxy(&state, provider), Ok(true)) {
-        let upstream = match call_openai_post_json(&state, request_id, "/v1/responses", &req).await
-        {
-            Ok(v) => v,
-            Err(resp) => return resp,
-        };
+    if should_openai_passthrough && matches!(should_proxy(&state, &target), Ok(true)) {
+        let upstream =
+            match call_openai_post_json(&state, request_id, &target, "/v1/responses", &req).await {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
 
         let stream_events = if stream {
             yallm_responses::response_to_stream_events(&upstream)
@@ -101,8 +106,8 @@ pub async fn responses_create(
     };
     ir.model = upstream_model.clone();
 
-    let ir_resp = match should_proxy(&state, provider) {
-        Ok(true) => match call_provider(&state, request_id, provider, &ir).await {
+    let ir_resp = match should_proxy(&state, &target) {
+        Ok(true) => match call_provider(&state, request_id, &target, &ir).await {
             Ok(resp) => resp,
             Err(err) => return proxy_error_to_response(provider, err),
         },
@@ -225,16 +230,23 @@ pub async fn responses_input_tokens(
     Json(req): Json<Value>,
 ) -> impl IntoResponse {
     if let Some(model) = req.get("model").and_then(Value::as_str) {
-        let (provider, _, _) = choose_provider(&state, model);
+        let target = choose_provider(&state, model);
+        let provider = target.provider;
         let convo = yallm_responses::extract_conversation_id(&req);
         let prev = yallm_responses::extract_previous_response_id(&req);
         if provider == Provider::OpenAI
             && convo.is_none()
             && prev.is_none()
-            && matches!(should_proxy(&state, provider), Ok(true))
+            && matches!(should_proxy(&state, &target), Ok(true))
         {
-            match call_openai_post_json(&state, request_id, "/v1/responses/input_tokens", &req)
-                .await
+            match call_openai_post_json(
+                &state,
+                request_id,
+                &target,
+                "/v1/responses/input_tokens",
+                &req,
+            )
+            .await
             {
                 Ok(v) => return (StatusCode::OK, Json(v)).into_response(),
                 Err(resp) => return resp,
@@ -255,15 +267,18 @@ pub async fn responses_compact(
     Json(req): Json<Value>,
 ) -> impl IntoResponse {
     if let Some(model) = req.get("model").and_then(Value::as_str) {
-        let (provider, _, _) = choose_provider(&state, model);
+        let target = choose_provider(&state, model);
+        let provider = target.provider;
         let convo = yallm_responses::extract_conversation_id(&req);
         let prev = yallm_responses::extract_previous_response_id(&req);
         if provider == Provider::OpenAI
             && convo.is_none()
             && prev.is_none()
-            && matches!(should_proxy(&state, provider), Ok(true))
+            && matches!(should_proxy(&state, &target), Ok(true))
         {
-            match call_openai_post_json(&state, request_id, "/v1/responses/compact", &req).await {
+            match call_openai_post_json(&state, request_id, &target, "/v1/responses/compact", &req)
+                .await
+            {
                 Ok(v) => return (StatusCode::OK, Json(v)).into_response(),
                 Err(resp) => return resp,
             }
@@ -422,10 +437,11 @@ fn sse_response(payload: String) -> Response {
 async fn call_openai_post_json(
     state: &AppState,
     request_id: u64,
+    target: &ProviderTarget,
     path: &str,
     body: &Value,
 ) -> Result<Value, Response> {
-    let Some(key) = state.provider.openai_api_key.clone() else {
+    let Some(key) = openai_api_key(state, target) else {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
@@ -438,10 +454,7 @@ async fn call_openai_post_json(
             .into_response());
     };
 
-    let url = format!(
-        "{}{path}",
-        state.provider.openai_base_url.trim_end_matches('/')
-    );
+    let url = normalized_openai_url(state, target, path);
     tracing::info!(
         event = "provider.out",
         request_id,

@@ -3,3 +3,7 @@ __pycache__/
 target/
 python/yallm-*.data/
 .venv/
+.agents/
+.claude/
+.yallm/secrets.toml
+.yallm/*.local.toml

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     body::{Body, to_bytes},
@@ -20,6 +20,23 @@ struct MockTransport {
     cap: Arc<TransportCapture>,
 }
 
+fn state_from_litellm_config(
+    config: &str,
+    env: HashMap<String, String>,
+    transport: MockTransport,
+) -> yallm_server::AppState {
+    let mut warnings = Vec::new();
+    let litellm_models = yallm_config::parse_litellm_config_str(config, &env, &mut warnings);
+    let mut state = yallm_server::AppState::from_loaded_config(yallm_config::LoadedConfig {
+        env,
+        litellm_models,
+        warnings,
+    });
+    state.transport = Arc::new(transport);
+    state.mode = yallm_server::Mode::Proxy;
+    state
+}
+
 impl yallm_server::Transport for MockTransport {
     fn send<'a>(
         &'a self,
@@ -30,18 +47,46 @@ impl yallm_server::Transport for MockTransport {
 
             if req.url.ends_with("/v1/chat/completions") {
                 let model = req.body.get("model").and_then(|v| v.as_str()).unwrap_or("");
-                let body = json!({
-                    "id": "chatcmpl_test",
-                    "object": "chat.completion",
-                    "created": 0,
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "hi"},
-                        "finish_reason": "stop"
-                    }],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-                });
+                let is_reasoning_case = req
+                    .body
+                    .get("messages")
+                    .and_then(|m| m.as_array())
+                    .and_then(|m| m.first())
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_str())
+                    .map(|c| c.contains("reason"))
+                    .unwrap_or(false);
+                let body = if is_reasoning_case {
+                    json!({
+                        "id": "chatcmpl_test",
+                        "object": "chat.completion",
+                        "created": 0,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "reasoning_content": "I considered the request."
+                            },
+                            "finish_reason": "length"
+                        }],
+                        "usage": {"prompt_tokens": 84, "completion_tokens": 64, "total_tokens": 148}
+                    })
+                } else {
+                    json!({
+                        "id": "chatcmpl_test",
+                        "object": "chat.completion",
+                        "created": 0,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "hi"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    })
+                };
 
                 return Ok(yallm_server::TransportResponse {
                     status: 200,
@@ -111,6 +156,15 @@ impl yallm_server::Transport for MockTransport {
                     .and_then(|c| c.as_str())
                     .map(|c| c.contains("tool"))
                     .unwrap_or(false);
+                let is_reasoning_case = req
+                    .body
+                    .get("messages")
+                    .and_then(|m| m.as_array())
+                    .and_then(|m| m.first())
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_str())
+                    .map(|c| c.contains("reason"))
+                    .unwrap_or(false);
                 let body = if is_tool_case {
                     let chunks = vec![
                         json!({
@@ -172,6 +226,62 @@ impl yallm_server::Transport for MockTransport {
                                 "index": 0,
                                 "delta": {},
                                 "finish_reason": "tool_calls"
+                            }]
+                        }),
+                    ];
+
+                    let mut body = String::new();
+                    for chunk in chunks {
+                        body.push_str("data: ");
+                        body.push_str(&chunk.to_string());
+                        body.push_str("\n\n");
+                    }
+                    body.push_str("data: [DONE]\n\n");
+                    body
+                } else if is_reasoning_case {
+                    let chunks = vec![
+                        json!({
+                            "id": "chatcmpl_test",
+                            "object": "chat.completion.chunk",
+                            "created": 0,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"role": "assistant"},
+                                "finish_reason": Value::Null
+                            }]
+                        }),
+                        json!({
+                            "id": "chatcmpl_test",
+                            "object": "chat.completion.chunk",
+                            "created": 0,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"reasoning_content": "I considered "},
+                                "finish_reason": Value::Null
+                            }]
+                        }),
+                        json!({
+                            "id": "chatcmpl_test",
+                            "object": "chat.completion.chunk",
+                            "created": 0,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"reasoning_content": "the request."},
+                                "finish_reason": Value::Null
+                            }]
+                        }),
+                        json!({
+                            "id": "chatcmpl_test",
+                            "object": "chat.completion.chunk",
+                            "created": 0,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "length"
                             }]
                         }),
                     ];
@@ -302,6 +412,278 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
 }
 
 #[tokio::test]
+async fn litellm_openai_alias_routes_to_configured_upstream() {
+    let cap = Arc::new(TransportCapture::default());
+    let transport = MockTransport { cap: cap.clone() };
+    let mut env = HashMap::new();
+    env.insert("OPENAI_KEY".to_string(), "alias_openai_key".to_string());
+    let state = state_from_litellm_config(
+        r#"
+model_list:
+  - model_name: gpt-alias
+    litellm_params:
+      model: openai/real-gpt
+      api_base: http://openai.test/v1
+      api_key: os.environ/OPENAI_KEY
+"#,
+        env,
+        transport,
+    );
+    let app = yallm_server::app_with_state(state);
+
+    let payload = json!({
+        "model": "gpt-alias",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let reqs = cap.requests.lock().await;
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].url, "http://openai.test/v1/chat/completions");
+    assert_eq!(reqs[0].body["model"], "real-gpt");
+    assert!(reqs[0].headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("authorization") && v == "Bearer alias_openai_key"
+    }));
+}
+
+#[tokio::test]
+async fn litellm_anthropic_alias_routes_with_env_key() {
+    let cap = Arc::new(TransportCapture::default());
+    let transport = MockTransport { cap: cap.clone() };
+    let mut env = HashMap::new();
+    env.insert(
+        "ANTHROPIC_KEY".to_string(),
+        "alias_anthropic_key".to_string(),
+    );
+    let state = state_from_litellm_config(
+        r#"
+model_list:
+  - model_name: claude-alias
+    litellm_params:
+      model: anthropic/claude-real
+      api_base: http://anthropic.test/v1
+      api_key: os.environ/ANTHROPIC_KEY
+      api_version: "2024-01-01"
+"#,
+        env,
+        transport,
+    );
+    let app = yallm_server::app_with_state(state);
+
+    let payload = json!({
+        "model": "claude-alias",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let reqs = cap.requests.lock().await;
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].url, "http://anthropic.test/v1/messages");
+    assert_eq!(reqs[0].body["model"], "claude-real");
+    assert!(
+        reqs[0]
+            .headers
+            .iter()
+            .any(|(k, v)| { k.eq_ignore_ascii_case("x-api-key") && v == "alias_anthropic_key" })
+    );
+    assert!(
+        reqs[0]
+            .headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("anthropic-version") && v == "2024-01-01")
+    );
+}
+
+#[tokio::test]
+async fn litellm_ollama_alias_routes_without_auth() {
+    let cap = Arc::new(TransportCapture::default());
+    let transport = MockTransport { cap: cap.clone() };
+    let state = state_from_litellm_config(
+        r#"
+model_list:
+  - model_name: local-llama
+    litellm_params:
+      model: ollama/llama3
+      api_base: http://ollama.test
+"#,
+        HashMap::new(),
+        transport,
+    );
+    let app = yallm_server::app_with_state(state);
+
+    let payload = json!({
+        "model": "local-llama",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let reqs = cap.requests.lock().await;
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].url, "http://ollama.test/api/chat");
+    assert_eq!(reqs[0].body["model"], "llama3");
+    assert!(reqs[0].headers.is_empty());
+}
+
+#[tokio::test]
+async fn litellm_models_list_exposes_supported_aliases_only() {
+    let cap = Arc::new(TransportCapture::default());
+    let transport = MockTransport { cap: cap.clone() };
+    let state = state_from_litellm_config(
+        r#"
+model_list:
+  - model_name: gpt-alias
+    litellm_params:
+      model: gpt-4o
+      api_key: test-key
+  - model_name: azure-alias
+    litellm_params:
+      model: azure/gpt-4o
+"#,
+        HashMap::new(),
+        transport,
+    );
+    let app = yallm_server::app_with_state(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    let ids: Vec<&str> = v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert_eq!(ids, vec!["gpt-alias"]);
+    assert_eq!(v["data"][0]["owned_by"], "litellm");
+}
+
+#[tokio::test]
+async fn litellm_models_list_exposes_all_aliases_under_all_interfaces() {
+    // Every alias is reachable via every protocol (yallm converts on the fly),
+    // so /v1/models lists the same alias set under every interface filter.
+    let cap = Arc::new(TransportCapture::default());
+    let transport = MockTransport { cap: cap.clone() };
+    let state = state_from_litellm_config(
+        r#"
+model_list:
+  - model_name: gpt-alias
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: test-key
+  - model_name: claude-alias
+    litellm_params:
+      model: anthropic/claude-3-haiku-20240307
+      api_key: test-key
+  - model_name: llama-alias
+    litellm_params:
+      model: ollama/llama3
+"#,
+        HashMap::new(),
+        transport,
+    );
+    let app = yallm_server::app_with_state(state);
+
+    for (uri, expected) in [
+        (
+            "/v1/models?interface=openai",
+            vec!["claude-alias", "gpt-alias", "llama-alias"],
+        ),
+        (
+            "/v1/models?interface=anthropic",
+            vec!["claude-alias", "gpt-alias", "llama-alias"],
+        ),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let mut ids: Vec<&str> = v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["id"].as_str())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, expected, "interface={uri}");
+    }
+}
+
+#[tokio::test]
+async fn run_rejects_partial_tls_config() {
+    use std::net::SocketAddr;
+    let cfg = yallm_server::ServerConfig {
+        addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        tls_cert: Some("/nonexistent/cert.pem".to_string()),
+        tls_key: None,
+        litellm_config: None,
+    };
+    let err = yallm_server::run(cfg).await.expect_err("should reject");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    let cfg = yallm_server::ServerConfig {
+        addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        tls_cert: None,
+        tls_key: Some("/nonexistent/key.pem".to_string()),
+        litellm_config: None,
+    };
+    let err = yallm_server::run(cfg).await.expect_err("should reject");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[tokio::test]
 async fn proxies_openai_to_openai_upstream_without_network() {
     let cap = Arc::new(TransportCapture::default());
     let transport = MockTransport { cap: cap.clone() };
@@ -349,6 +731,49 @@ async fn proxies_openai_to_openai_upstream_without_network() {
             .iter()
             .any(|(k, v)| k.eq_ignore_ascii_case("authorization") && v == "Bearer test_openai_key")
     );
+}
+
+#[tokio::test]
+async fn maps_openai_reasoning_to_anthropic_thinking_without_network() {
+    let cap = Arc::new(TransportCapture::default());
+    let transport = MockTransport { cap: cap.clone() };
+
+    let mut state = yallm_server::AppState {
+        transport: Arc::new(transport),
+        mode: yallm_server::Mode::Proxy,
+        ..Default::default()
+    };
+    state.provider.openai_api_key = Some("test_openai_key".to_string());
+    state.provider.openai_base_url = "http://openai.test".to_string();
+
+    let app = yallm_server::app_with_state(state);
+    let payload = json!({
+        "model": "openai:deepseek-v4-flash",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "please reason"}]
+    });
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(v["model"], "deepseek-v4-flash");
+    assert_eq!(v["stop_reason"], "max_tokens");
+    assert_eq!(v["content"][0]["type"], "thinking");
+    assert_eq!(v["content"][0]["thinking"], "I considered the request.");
+    assert_eq!(v["content"][0]["signature"], "chatcmpl_test");
 }
 
 #[tokio::test]
@@ -547,4 +972,50 @@ async fn maps_streaming_tool_calls_openai_to_anthropic() {
     assert!(body.contains("\"type\":\"tool_use\""));
     assert!(body.contains("\"type\":\"input_json_delta\""));
     assert!(body.contains("\"stop_reason\":\"tool_use\""));
+}
+
+#[tokio::test]
+async fn maps_streaming_openai_reasoning_to_anthropic_thinking() {
+    let cap = Arc::new(TransportCapture::default());
+    let transport = MockTransport { cap: cap.clone() };
+
+    let mut state = yallm_server::AppState {
+        transport: Arc::new(transport),
+        mode: yallm_server::Mode::Proxy,
+        ..Default::default()
+    };
+    state.provider.openai_api_key = Some("test_openai_key".to_string());
+    state.provider.openai_base_url = "http://openai.test".to_string();
+
+    let app = yallm_server::app_with_state(state);
+    let payload = json!({
+        "model": "openai:deepseek-v4-flash",
+        "stream": true,
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "please reason"}]
+    });
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+
+    assert!(body.contains("\"type\":\"thinking\""));
+    assert!(body.contains("\"type\":\"thinking_delta\""));
+    assert!(body.contains("I considered "));
+    assert!(body.contains("the request."));
+    assert!(body.contains("\"type\":\"signature_delta\""));
+    assert!(body.contains("\"signature\":\"chatcmpl_test\""));
+    assert!(body.contains("\"stop_reason\":\"max_tokens\""));
 }

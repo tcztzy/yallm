@@ -105,6 +105,25 @@ Anthropic with model `claude-3-haiku-20240307`).
 - `proxy`: always proxy (missing config returns an error)
 - `mock`: always mock (never calls upstream)
 
+### Configuration Layers
+
+Config is loaded from multiple layers, highest priority first:
+
+1. `.yallm/secrets.toml` — project secrets (gitignored)
+2. `.yallm/*.local.toml` — per-machine overrides, applied in filename order (gitignored)
+3. `.yallm/config.toml` — committed project config
+4. `~/.yallm/config.toml` — user defaults
+5. OS environment variables
+6. `.env` — only fills keys absent from OS env (does not override)
+
+Each TOML file uses an `[env]` table:
+
+```toml
+[env]
+ANTHROPIC_API_KEY = "sk-ant-..."
+YALLM_DEFAULT_PROVIDER = "anthropic"
+```
+
 ### Provider Environment Variables
 
 OpenAI:
@@ -112,7 +131,7 @@ OpenAI:
 - `OPENAI_BASE_URL` (default `https://api.openai.com`)
 
 Anthropic:
-- `ANTHROPIC_API_KEY` (required for proxying)
+- `ANTHROPIC_API_KEY` (required for proxying; or `ANTHROPIC_AUTH_TOKEN` for bearer-token gateways)
 - `ANTHROPIC_BASE_URL` (default `https://api.anthropic.com`)
 - `ANTHROPIC_VERSION` (default `2023-06-01`)
 
@@ -121,6 +140,49 @@ Ollama:
 
 Local storage:
 - `YALLM_STORAGE_PATH` (optional): local JSON file path for persisted responses/conversations history.
+
+### LiteLLM Config Compatibility
+
+Point yallm at a LiteLLM `config.yaml` with `--litellm-config <path>` or
+`YALLM_LITELLM_CONFIG=<path>`. The CLI flag wins when both are set.
+
+Each model alias is reachable via **every** supported protocol — yallm converts
+between OpenAI / Anthropic / Ollama formats on the fly. An alias whose upstream
+is `openai/gpt-4o` can be called from `/v1/chat/completions`, `/v1/messages`,
+or `/api/chat`. `GET /v1/models` therefore lists the same alias set under every
+`?interface=` filter.
+
+#### `yallm_params` (preferred) vs `litellm_params` (compatibility)
+
+`litellm_params` exists for drop-in compatibility with existing LiteLLM
+config files. New configs should use `yallm_params`, which makes the provider
+explicit instead of prefix-encoding it in the model string. When both blocks
+appear on the same entry, **`yallm_params` wins**.
+
+```yaml
+model_list:
+  - model_name: gpt-alias
+    yallm_params:                    # preferred
+      provider: openai               # one of: openai | anthropic | ollama
+      model: gpt-4o
+      api_base: https://openai-compatible.example/v1
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: claude-alias         # legacy LiteLLM-style entry still works
+    litellm_params:
+      model: anthropic/claude-3-haiku-20240307
+      api_key: os.environ/ANTHROPIC_API_KEY
+```
+
+Supported `litellm_params` v1 fields: `model_name` and
+`litellm_params.model/api_base/api_key/api_version/custom_llm_provider` for
+OpenAI-compatible, Anthropic, and Ollama upstreams. Exact aliases take priority
+over prefix/default-provider routing. Advanced LiteLLM router features,
+fallback rules, budgets, wildcard model groups, and Azure OpenAI routing are
+not implemented.
+
+Use env references for keys instead of committing secrets — both
+`os.environ/VAR` and `${VAR}` syntaxes are accepted.
 
 ### Logging (Fluentd-Friendly JSON)
 

@@ -8,11 +8,11 @@
 use axum::{
     Json,
     body::Body,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
@@ -37,6 +37,68 @@ pub struct HealthResponse {
 /// Health check endpoint
 pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+/// Root endpoint — gateway liveness check (used by Claude for Office, etc.)
+pub async fn root() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "ok",
+            "message": "yallm gateway ready"
+        })),
+    )
+}
+
+/// Query parameters for `GET /v1/models`
+#[derive(Debug, Deserialize)]
+pub struct ModelsQuery {
+    pub interface: Option<String>,
+}
+
+/// List models for the given API interface type.
+/// Defaults to `default_provider` when `interface` query param is absent.
+/// Model list configured via `YALLM_OPENAI_MODELS` / `YALLM_ANTHROPIC_MODELS` env vars.
+pub async fn models_list(
+    State(state): State<AppState>,
+    Query(query): Query<ModelsQuery>,
+) -> impl IntoResponse {
+    let interface = query
+        .interface
+        .as_deref()
+        .unwrap_or_else(|| state.default_provider.as_str());
+    let litellm_models = !state.model_routes.is_empty();
+
+    match interface {
+        "anthropic" => {
+            let data: Vec<Value> = state
+                .anthropic_models
+                .iter()
+                .map(|id| {
+                    json!({
+                        "type": "model",
+                        "id": id,
+                    })
+                })
+                .collect();
+            Json(json!({ "data": data })).into_response()
+        }
+        _ => {
+            let data: Vec<Value> = state
+                .openai_models
+                .iter()
+                .map(|id| {
+                    json!({
+                        "id": id,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": if litellm_models { "litellm" } else { "openai" },
+                    })
+                })
+                .collect();
+            Json(json!({ "object": "list", "data": data })).into_response()
+        }
+    }
 }
 
 pub async fn fallback() -> impl IntoResponse {
@@ -111,13 +173,15 @@ pub async fn chat_completions(
         }
     };
 
-    let (provider, downstream_model, upstream_model) = choose_provider(&state, model);
+    let target = choose_provider(&state, model);
+    let provider = target.provider;
+    let upstream_model = target.upstream_model.clone();
     tracing::info!(
         event = "route",
         request_id,
         downstream = "openai",
         provider = provider.as_str(),
-        downstream_model = %downstream_model,
+        downstream_model = %target.downstream_model,
         upstream_model = %upstream_model
     );
 
@@ -147,10 +211,10 @@ pub async fn chat_completions(
         model = %ir.model
     );
 
-    match should_proxy(&state, provider) {
+    match should_proxy(&state, &target) {
         Ok(true) => {
             if stream {
-                match call_provider_stream(&state, request_id, provider, &ir).await {
+                match call_provider_stream(&state, request_id, &target, &ir).await {
                     Ok(stream_resp) => {
                         tracing::info!(
                             event = "convert.provider_to_ir_stream",
@@ -173,7 +237,7 @@ pub async fn chat_completions(
                     Err(e) => proxy_error_to_response(provider, e).into_response(),
                 }
             } else {
-                match call_provider(&state, request_id, provider, &ir).await {
+                match call_provider(&state, request_id, &target, &ir).await {
                     Ok(ir_resp) => {
                         tracing::info!(
                             event = "convert.provider_to_ir",
@@ -227,13 +291,15 @@ pub async fn anthropic_messages(
         }
     };
 
-    let (provider, downstream_model, upstream_model) = choose_provider(&state, model);
+    let target = choose_provider(&state, model);
+    let provider = target.provider;
+    let upstream_model = target.upstream_model.clone();
     tracing::info!(
         event = "route",
         request_id,
         downstream = "anthropic",
         provider = provider.as_str(),
-        downstream_model = %downstream_model,
+        downstream_model = %target.downstream_model,
         upstream_model = %upstream_model
     );
 
@@ -263,10 +329,10 @@ pub async fn anthropic_messages(
         model = %ir.model
     );
 
-    match should_proxy(&state, provider) {
+    match should_proxy(&state, &target) {
         Ok(true) => {
             if stream {
-                match call_provider_stream(&state, request_id, provider, &ir).await {
+                match call_provider_stream(&state, request_id, &target, &ir).await {
                     Ok(stream_resp) => {
                         tracing::info!(
                             event = "convert.provider_to_ir_stream",
@@ -289,7 +355,7 @@ pub async fn anthropic_messages(
                     Err(e) => proxy_error_to_response(provider, e).into_response(),
                 }
             } else {
-                match call_provider(&state, request_id, provider, &ir).await {
+                match call_provider(&state, request_id, &target, &ir).await {
                     Ok(ir_resp) => {
                         tracing::info!(
                             event = "convert.provider_to_ir",
@@ -342,13 +408,15 @@ pub async fn ollama_chat(
         }
     };
 
-    let (provider, downstream_model, upstream_model) = choose_provider(&state, model);
+    let target = choose_provider(&state, model);
+    let provider = target.provider;
+    let upstream_model = target.upstream_model.clone();
     tracing::info!(
         event = "route",
         request_id,
         downstream = "ollama",
         provider = provider.as_str(),
-        downstream_model = %downstream_model,
+        downstream_model = %target.downstream_model,
         upstream_model = %upstream_model
     );
 
@@ -378,10 +446,10 @@ pub async fn ollama_chat(
         model = %ir.model
     );
 
-    match should_proxy(&state, provider) {
+    match should_proxy(&state, &target) {
         Ok(true) => {
             if stream {
-                match call_provider_stream(&state, request_id, provider, &ir).await {
+                match call_provider_stream(&state, request_id, &target, &ir).await {
                     Ok(stream_resp) => {
                         tracing::info!(
                             event = "convert.provider_to_ir_stream",
@@ -404,7 +472,7 @@ pub async fn ollama_chat(
                     Err(e) => proxy_error_to_response(provider, e).into_response(),
                 }
             } else {
-                match call_provider(&state, request_id, provider, &ir).await {
+                match call_provider(&state, request_id, &target, &ir).await {
                     Ok(ir_resp) => {
                         tracing::info!(
                             event = "convert.provider_to_ir",

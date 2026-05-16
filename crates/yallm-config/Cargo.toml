@@ -1,0 +1,14 @@
+[package]
+name = "yallm-config"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Layered TOML config loading for yallm"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
+toml = "0.8"
+tracing = "0.1"

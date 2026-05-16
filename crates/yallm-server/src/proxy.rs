@@ -7,7 +7,7 @@ use yallm_ir::{ChatRequest, ChatResponse, Choice, Content, Message, Role, Source
 
 use crate::{
     logging::redact_json_secrets,
-    state::{AppState, Mode, Provider, TransportByteStream, TransportRequest},
+    state::{AppState, Mode, ModelRoute, Provider, TransportByteStream, TransportRequest},
 };
 
 mod stream;
@@ -36,25 +36,47 @@ fn provider_from_model(model: &str) -> (Option<Provider>, String) {
     (None, model.to_string())
 }
 
-pub fn choose_provider(state: &AppState, model: &str) -> (Provider, String, String) {
-    let (from_prefix, stripped) = provider_from_model(model);
-    let provider = from_prefix.unwrap_or(state.default_provider);
-    (provider, model.to_string(), stripped)
+#[derive(Debug, Clone)]
+pub struct ProviderTarget {
+    pub provider: Provider,
+    pub downstream_model: String,
+    pub upstream_model: String,
+    pub route: Option<ModelRoute>,
 }
 
-pub fn should_proxy(state: &AppState, provider: Provider) -> Result<bool, ProxyError> {
+pub fn choose_provider(state: &AppState, model: &str) -> ProviderTarget {
+    if let Some(route) = state.model_routes.get(model) {
+        return ProviderTarget {
+            provider: route.provider,
+            downstream_model: model.to_string(),
+            upstream_model: route.upstream_model.clone(),
+            route: Some(route.clone()),
+        };
+    }
+
+    let (from_prefix, stripped) = provider_from_model(model);
+    let provider = from_prefix.unwrap_or(state.default_provider);
+    ProviderTarget {
+        provider,
+        downstream_model: model.to_string(),
+        upstream_model: stripped,
+        route: None,
+    }
+}
+
+pub fn should_proxy(state: &AppState, target: &ProviderTarget) -> Result<bool, ProxyError> {
     match state.mode {
         Mode::Mock => Ok(false),
-        Mode::Auto => Ok(provider_is_configured(state, provider)),
+        Mode::Auto => Ok(provider_is_configured(state, target)),
         Mode::Proxy => {
-            if provider_is_configured(state, provider) {
+            if provider_is_configured(state, target) {
                 Ok(true)
             } else {
                 Err(ProxyError {
                     status: 500,
                     message: format!(
                         "Missing configuration for provider {} (set required env vars)",
-                        provider.as_str()
+                        target.provider.as_str()
                     ),
                     upstream_body: None,
                 })
@@ -63,10 +85,13 @@ pub fn should_proxy(state: &AppState, provider: Provider) -> Result<bool, ProxyE
     }
 }
 
-fn provider_is_configured(state: &AppState, provider: Provider) -> bool {
-    match provider {
-        Provider::OpenAI => state.provider.openai_api_key.is_some(),
-        Provider::Anthropic => state.provider.anthropic_api_key.is_some(),
+fn provider_is_configured(state: &AppState, target: &ProviderTarget) -> bool {
+    match target.provider {
+        Provider::OpenAI => openai_api_key(state, target).is_some(),
+        Provider::Anthropic => {
+            anthropic_api_key(state, target).is_some()
+                || state.provider.anthropic_auth_token.is_some()
+        }
         Provider::Ollama => true, // base_url is always present; Ollama typically does not need a key
     }
 }
@@ -74,13 +99,13 @@ fn provider_is_configured(state: &AppState, provider: Provider) -> bool {
 pub async fn call_provider(
     state: &AppState,
     request_id: u64,
-    provider: Provider,
+    target: &ProviderTarget,
     ir: &ChatRequest,
 ) -> Result<ChatResponse, ProxyError> {
-    match provider {
-        Provider::OpenAI => call_openai(state, request_id, ir).await,
-        Provider::Anthropic => call_anthropic(state, request_id, ir).await,
-        Provider::Ollama => call_ollama(state, request_id, ir).await,
+    match target.provider {
+        Provider::OpenAI => call_openai(state, request_id, target, ir).await,
+        Provider::Anthropic => call_anthropic(state, request_id, target, ir).await,
+        Provider::Ollama => call_ollama(state, request_id, target, ir).await,
     }
 }
 
@@ -102,14 +127,79 @@ pub enum DownstreamProtocol {
 pub async fn call_provider_stream(
     state: &AppState,
     request_id: u64,
-    provider: Provider,
+    target: &ProviderTarget,
     ir: &ChatRequest,
 ) -> Result<ProviderStream, ProxyError> {
-    match provider {
-        Provider::OpenAI => call_openai_stream(state, request_id, ir).await,
-        Provider::Anthropic => call_anthropic_stream(state, request_id, ir).await,
-        Provider::Ollama => call_ollama_stream(state, request_id, ir).await,
+    match target.provider {
+        Provider::OpenAI => call_openai_stream(state, request_id, target, ir).await,
+        Provider::Anthropic => call_anthropic_stream(state, request_id, target, ir).await,
+        Provider::Ollama => call_ollama_stream(state, request_id, target, ir).await,
     }
+}
+
+pub fn openai_api_key(state: &AppState, target: &ProviderTarget) -> Option<String> {
+    target
+        .route
+        .as_ref()
+        .and_then(|route| route.api_key.clone())
+        .or_else(|| state.provider.openai_api_key.clone())
+}
+
+pub fn openai_base_url(state: &AppState, target: &ProviderTarget) -> String {
+    target
+        .route
+        .as_ref()
+        .and_then(|route| route.api_base.clone())
+        .unwrap_or_else(|| state.provider.openai_base_url.clone())
+}
+
+pub fn normalized_openai_url(state: &AppState, target: &ProviderTarget, path: &str) -> String {
+    format!(
+        "{}{}",
+        trim_version_suffix(&openai_base_url(state, target), "v1"),
+        path
+    )
+}
+
+fn anthropic_api_key(state: &AppState, target: &ProviderTarget) -> Option<String> {
+    target
+        .route
+        .as_ref()
+        .and_then(|route| route.api_key.clone())
+        .or_else(|| state.provider.anthropic_api_key.clone())
+}
+
+fn anthropic_base_url(state: &AppState, target: &ProviderTarget) -> String {
+    target
+        .route
+        .as_ref()
+        .and_then(|route| route.api_base.clone())
+        .unwrap_or_else(|| state.provider.anthropic_base_url.clone())
+}
+
+fn anthropic_version(state: &AppState, target: &ProviderTarget) -> String {
+    target
+        .route
+        .as_ref()
+        .and_then(|route| route.api_version.clone())
+        .unwrap_or_else(|| state.provider.anthropic_version.clone())
+}
+
+fn ollama_base_url(state: &AppState, target: &ProviderTarget) -> String {
+    target
+        .route
+        .as_ref()
+        .and_then(|route| route.api_base.clone())
+        .unwrap_or_else(|| state.provider.ollama_base_url.clone())
+}
+
+fn trim_version_suffix(base_url: &str, suffix: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    let version_suffix = format!("/{suffix}");
+    trimmed
+        .strip_suffix(&version_suffix)
+        .unwrap_or(trimmed)
+        .to_string()
 }
 
 fn redact_headers(headers: &[(String, String)]) -> Value {
@@ -133,9 +223,10 @@ fn redact_headers(headers: &[(String, String)]) -> Value {
 async fn call_openai(
     state: &AppState,
     request_id: u64,
+    target: &ProviderTarget,
     ir: &ChatRequest,
 ) -> Result<ChatResponse, ProxyError> {
-    let Some(key) = state.provider.openai_api_key.clone() else {
+    let Some(key) = openai_api_key(state, target) else {
         return Err(ProxyError {
             status: 500,
             message: "OPENAI_API_KEY is not set".to_string(),
@@ -143,10 +234,7 @@ async fn call_openai(
         });
     };
 
-    let url = format!(
-        "{}/v1/chat/completions",
-        state.provider.openai_base_url.trim_end_matches('/')
-    );
+    let url = normalized_openai_url(state, target, "/v1/chat/completions");
     let body = ir_to_openai_request_json(ir);
     let started = Instant::now();
 
@@ -207,30 +295,32 @@ async fn call_openai(
 async fn call_anthropic(
     state: &AppState,
     request_id: u64,
+    target: &ProviderTarget,
     ir: &ChatRequest,
 ) -> Result<ChatResponse, ProxyError> {
-    let Some(key) = state.provider.anthropic_api_key.clone() else {
-        return Err(ProxyError {
-            status: 500,
-            message: "ANTHROPIC_API_KEY is not set".to_string(),
-            upstream_body: None,
-        });
-    };
-
     let url = format!(
         "{}/v1/messages",
-        state.provider.anthropic_base_url.trim_end_matches('/')
+        trim_version_suffix(&anthropic_base_url(state, target), "v1")
     );
     let body = ir_to_anthropic_request_json(ir);
     let started = Instant::now();
 
-    let headers = vec![
-        ("x-api-key".to_string(), key),
-        (
-            "anthropic-version".to_string(),
-            state.provider.anthropic_version.clone(),
-        ),
-    ];
+    let mut headers = vec![(
+        "anthropic-version".to_string(),
+        anthropic_version(state, target),
+    )];
+
+    if let Some(key) = anthropic_api_key(state, target) {
+        headers.push(("x-api-key".to_string(), key));
+    } else if let Some(token) = state.provider.anthropic_auth_token.clone() {
+        headers.push(("authorization".to_string(), format!("Bearer {token}")));
+    } else {
+        return Err(ProxyError {
+            status: 500,
+            message: "ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is not set".to_string(),
+            upstream_body: None,
+        });
+    }
 
     tracing::info!(
         event = "provider.out",
@@ -287,11 +377,12 @@ async fn call_anthropic(
 async fn call_ollama(
     state: &AppState,
     request_id: u64,
+    target: &ProviderTarget,
     ir: &ChatRequest,
 ) -> Result<ChatResponse, ProxyError> {
     let url = format!(
         "{}/api/chat",
-        state.provider.ollama_base_url.trim_end_matches('/')
+        ollama_base_url(state, target).trim_end_matches('/')
     );
     let body = ir_to_ollama_request_json(ir);
     let started = Instant::now();
@@ -351,9 +442,10 @@ async fn call_ollama(
 async fn call_openai_stream(
     state: &AppState,
     request_id: u64,
+    target: &ProviderTarget,
     ir: &ChatRequest,
 ) -> Result<ProviderStream, ProxyError> {
-    let Some(key) = state.provider.openai_api_key.clone() else {
+    let Some(key) = openai_api_key(state, target) else {
         return Err(ProxyError {
             status: 500,
             message: "OPENAI_API_KEY is not set".to_string(),
@@ -361,10 +453,7 @@ async fn call_openai_stream(
         });
     };
 
-    let url = format!(
-        "{}/v1/chat/completions",
-        state.provider.openai_base_url.trim_end_matches('/')
-    );
+    let url = normalized_openai_url(state, target, "/v1/chat/completions");
     let body = with_stream_flag(ir_to_openai_request_json(ir), true);
     let started = Instant::now();
     let headers = vec![("authorization".to_string(), format!("Bearer {key}"))];
@@ -420,29 +509,32 @@ async fn call_openai_stream(
 async fn call_anthropic_stream(
     state: &AppState,
     request_id: u64,
+    target: &ProviderTarget,
     ir: &ChatRequest,
 ) -> Result<ProviderStream, ProxyError> {
-    let Some(key) = state.provider.anthropic_api_key.clone() else {
-        return Err(ProxyError {
-            status: 500,
-            message: "ANTHROPIC_API_KEY is not set".to_string(),
-            upstream_body: None,
-        });
-    };
-
     let url = format!(
         "{}/v1/messages",
-        state.provider.anthropic_base_url.trim_end_matches('/')
+        trim_version_suffix(&anthropic_base_url(state, target), "v1")
     );
     let body = with_stream_flag(ir_to_anthropic_request_json(ir), true);
     let started = Instant::now();
-    let headers = vec![
-        ("x-api-key".to_string(), key),
-        (
-            "anthropic-version".to_string(),
-            state.provider.anthropic_version.clone(),
-        ),
-    ];
+
+    let mut headers = vec![(
+        "anthropic-version".to_string(),
+        anthropic_version(state, target),
+    )];
+
+    if let Some(key) = anthropic_api_key(state, target) {
+        headers.push(("x-api-key".to_string(), key));
+    } else if let Some(token) = state.provider.anthropic_auth_token.clone() {
+        headers.push(("authorization".to_string(), format!("Bearer {token}")));
+    } else {
+        return Err(ProxyError {
+            status: 500,
+            message: "ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is not set".to_string(),
+            upstream_body: None,
+        });
+    }
 
     tracing::info!(
         event = "provider.out",
@@ -495,11 +587,12 @@ async fn call_anthropic_stream(
 async fn call_ollama_stream(
     state: &AppState,
     request_id: u64,
+    target: &ProviderTarget,
     ir: &ChatRequest,
 ) -> Result<ProviderStream, ProxyError> {
     let url = format!(
         "{}/api/chat",
-        state.provider.ollama_base_url.trim_end_matches('/')
+        ollama_base_url(state, target).trim_end_matches('/')
     );
     let body = with_stream_flag(ir_to_ollama_request_json(ir), true);
     let started = Instant::now();
@@ -1039,7 +1132,9 @@ fn openai_response_json_to_ir(v: Value) -> Option<ChatResponse> {
         model: model.clone(),
         choices: vec![Choice {
             index: 0,
-            message: Message::new(Role::Assistant, content).with_source(Source::OpenAI),
+            message: Message::new(Role::Assistant, content)
+                .with_source(Source::OpenAI)
+                .with_raw(msg_v),
             finish_reason,
         }],
         usage,
@@ -1050,8 +1145,45 @@ fn anthropic_response_json_to_ir(v: Value) -> Option<ChatResponse> {
     let id = v.get("id")?.as_str()?.to_string();
     let model = v.get("model")?.as_str()?.to_string();
 
-    let content_blocks = v.get("content")?.as_array()?;
+    let content_blocks = v.get("content").and_then(|c| c.as_array());
     let mut content = Vec::new();
+
+    // DeepSeek may put reasoning in a top-level field instead of content blocks.
+    if let Some(reasoning) = v
+        .get("reasoning_content")
+        .and_then(|r| r.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        content.push(Content::text(reasoning.to_string()));
+    }
+
+    let Some(content_blocks) = content_blocks else {
+        // No content blocks at all — maybe a bare error or unsupported format.
+        if content.is_empty() {
+            return None;
+        }
+        return Some(ChatResponse {
+            id,
+            model: model.clone(),
+            choices: vec![Choice {
+                index: 0,
+                message: Message::new(Role::Assistant, content).with_source(Source::Anthropic),
+                finish_reason: v
+                    .get("stop_reason")
+                    .and_then(|r| r.as_str())
+                    .map(|s| s.to_string()),
+            }],
+            usage: v.get("usage").and_then(|u| {
+                Some(Usage {
+                    prompt_tokens: u.get("input_tokens")?.as_u64()? as u32,
+                    completion_tokens: u.get("output_tokens")?.as_u64()? as u32,
+                    total_tokens: (u.get("input_tokens")?.as_u64()?
+                        + u.get("output_tokens")?.as_u64()?)
+                        as u32,
+                })
+            }),
+        });
+    };
     for b in content_blocks {
         let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
         match ty {
@@ -1061,7 +1193,7 @@ fn anthropic_response_json_to_ir(v: Value) -> Option<ChatResponse> {
                     content.push(Content::text(text.to_string()));
                 }
             }
-            "tool_use" => {
+            "tool_use" | "server_tool_use" => {
                 let id = b
                     .get("id")
                     .and_then(|x| x.as_str())
@@ -1079,6 +1211,23 @@ fn anthropic_response_json_to_ir(v: Value) -> Option<ChatResponse> {
                         name,
                         arguments: serde_json::to_string(&input).unwrap_or_default(),
                     }));
+                }
+            }
+            "thinking" | "reasoning" => {
+                let text = b
+                    .get("thinking")
+                    .or(b.get("reasoning"))
+                    .or(b.get("text"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                if !text.is_empty() {
+                    content.push(Content::text(text.to_string()));
+                }
+            }
+            "redacted_thinking" => {
+                let text = b.get("data").and_then(|t| t.as_str()).unwrap_or("");
+                if !text.is_empty() {
+                    content.push(Content::text(format!("[redacted thinking: {text}]")));
                 }
             }
             _ => {}
@@ -1176,11 +1325,17 @@ pub use stream::map_provider_stream_to_downstream;
 
 pub fn ir_to_openai_downstream_response(ir_resp: &ChatResponse, model: &str) -> Value {
     let created = unix_seconds();
-    let (content_text, tool_calls) = ir_assistant_to_openai_message(ir_resp);
+    let (content_text, reasoning_text, tool_calls) = ir_assistant_to_openai_message(ir_resp);
 
     let mut msg = serde_json::Map::new();
     msg.insert("role".to_string(), Value::String("assistant".to_string()));
     msg.insert("content".to_string(), Value::String(content_text));
+    if !reasoning_text.is_empty() {
+        msg.insert(
+            "reasoning_content".to_string(),
+            Value::String(reasoning_text),
+        );
+    }
     if let Some(tcs) = tool_calls {
         msg.insert("tool_calls".to_string(), Value::Array(tcs));
     }
@@ -1226,10 +1381,16 @@ pub fn ir_to_openai_downstream_response(ir_resp: &ChatResponse, model: &str) -> 
 
 pub fn ir_to_openai_downstream_stream(ir_resp: &ChatResponse, model: &str) -> String {
     let created = unix_seconds();
-    let (content_text, tool_calls) = ir_assistant_to_openai_message(ir_resp);
+    let (content_text, reasoning_text, tool_calls) = ir_assistant_to_openai_message(ir_resp);
 
     let mut delta = serde_json::Map::new();
     delta.insert("role".to_string(), Value::String("assistant".to_string()));
+    if !reasoning_text.is_empty() {
+        delta.insert(
+            "reasoning_content".to_string(),
+            Value::String(reasoning_text),
+        );
+    }
     if !content_text.is_empty() {
         delta.insert("content".to_string(), Value::String(content_text));
     }
@@ -1272,13 +1433,18 @@ pub fn ir_to_openai_downstream_stream(ir_resp: &ChatResponse, model: &str) -> St
     out
 }
 
-fn ir_assistant_to_openai_message(ir_resp: &ChatResponse) -> (String, Option<Vec<Value>>) {
+fn ir_assistant_to_openai_message(ir_resp: &ChatResponse) -> (String, String, Option<Vec<Value>>) {
     let msg = ir_resp.choices.first().map(|c| &c.message);
     let Some(msg) = msg else {
-        return (String::new(), None);
+        return (String::new(), String::new(), None);
     };
 
     let content_text = join_text(&msg.content, "\n");
+    let reasoning_text = msg
+        .raw
+        .as_ref()
+        .map(openai_reasoning_text)
+        .unwrap_or_default();
     let tool_calls: Vec<Value> = msg
         .content
         .iter()
@@ -1294,6 +1460,7 @@ fn ir_assistant_to_openai_message(ir_resp: &ChatResponse) -> (String, Option<Vec
 
     (
         content_text,
+        reasoning_text,
         if tool_calls.is_empty() {
             None
         } else {
@@ -1303,11 +1470,7 @@ fn ir_assistant_to_openai_message(ir_resp: &ChatResponse) -> (String, Option<Vec
 }
 
 pub fn ir_to_anthropic_downstream_response(ir_resp: &ChatResponse, model: &str) -> Value {
-    let text = ir_resp
-        .choices
-        .first()
-        .map(|c| join_text(&c.message.content, "\n"))
-        .unwrap_or_default();
+    let (text, reasoning_text) = ir_assistant_text_and_reasoning(ir_resp);
 
     let usage = ir_resp.usage.as_ref().map(|u| {
         json!({
@@ -1322,18 +1485,17 @@ pub fn ir_to_anthropic_downstream_response(ir_resp: &ChatResponse, model: &str) 
     obj.insert("role".to_string(), Value::String("assistant".to_string()));
     obj.insert(
         "content".to_string(),
-        Value::Array(vec![json!({"type": "text", "text": text})]),
+        anthropic_content_blocks(&ir_resp.id, reasoning_text, text),
     );
     obj.insert("model".to_string(), Value::String(model.to_string()));
     obj.insert(
         "stop_reason".to_string(),
-        Value::String(
+        Value::String(map_to_anthropic_stop_reason(
             ir_resp
                 .choices
                 .first()
-                .and_then(|c| c.finish_reason.clone())
-                .unwrap_or_else(|| "end_turn".to_string()),
-        ),
+                .and_then(|c| c.finish_reason.as_deref()),
+        )),
     );
     obj.insert("stop_sequence".to_string(), Value::Null);
     obj.insert(
@@ -1344,22 +1506,19 @@ pub fn ir_to_anthropic_downstream_response(ir_resp: &ChatResponse, model: &str) 
 }
 
 pub fn ir_to_anthropic_downstream_stream(ir_resp: &ChatResponse, model: &str) -> String {
-    let text = ir_resp
-        .choices
-        .first()
-        .map(|c| join_text(&c.message.content, "\n"))
-        .unwrap_or_default();
+    let (text, reasoning_text) = ir_assistant_text_and_reasoning(ir_resp);
     let prompt_tokens = ir_resp.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0);
     let completion_tokens = ir_resp
         .usage
         .as_ref()
         .map(|u| u.completion_tokens)
         .unwrap_or(0);
-    let stop_reason = ir_resp
-        .choices
-        .first()
-        .and_then(|c| c.finish_reason.clone())
-        .unwrap_or_else(|| "end_turn".to_string());
+    let stop_reason = map_to_anthropic_stop_reason(
+        ir_resp
+            .choices
+            .first()
+            .and_then(|c| c.finish_reason.as_deref()),
+    );
 
     let mut out = String::new();
     out.push_str(&sse_event_frame(
@@ -1382,12 +1541,59 @@ pub fn ir_to_anthropic_downstream_stream(ir_resp: &ChatResponse, model: &str) ->
         }),
     ));
 
-    if !text.is_empty() {
+    let mut next_index = 0;
+    if !reasoning_text.is_empty() {
+        let index = next_index;
+        next_index += 1;
         out.push_str(&sse_event_frame(
             "content_block_start",
             json!({
                 "type": "content_block_start",
-                "index": 0,
+                "index": index,
+                "content_block": {
+                    "type": "thinking",
+                    "thinking": "",
+                }
+            }),
+        ));
+        out.push_str(&sse_event_frame(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "thinking_delta",
+                    "thinking": reasoning_text,
+                }
+            }),
+        ));
+        out.push_str(&sse_event_frame(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": ir_resp.id,
+                }
+            }),
+        ));
+        out.push_str(&sse_event_frame(
+            "content_block_stop",
+            json!({
+                "type": "content_block_stop",
+                "index": index,
+            }),
+        ));
+    }
+
+    if !text.is_empty() {
+        let index = next_index;
+        out.push_str(&sse_event_frame(
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": index,
                 "content_block": {
                     "type": "text",
                     "text": "",
@@ -1398,7 +1604,7 @@ pub fn ir_to_anthropic_downstream_stream(ir_resp: &ChatResponse, model: &str) ->
             "content_block_delta",
             json!({
                 "type": "content_block_delta",
-                "index": 0,
+                "index": index,
                 "delta": {
                     "type": "text_delta",
                     "text": text,
@@ -1409,7 +1615,7 @@ pub fn ir_to_anthropic_downstream_stream(ir_resp: &ChatResponse, model: &str) ->
             "content_block_stop",
             json!({
                 "type": "content_block_stop",
-                "index": 0,
+                "index": index,
             }),
         ));
     }
@@ -1432,6 +1638,61 @@ pub fn ir_to_anthropic_downstream_stream(ir_resp: &ChatResponse, model: &str) ->
         json!({ "type": "message_stop" }),
     ));
     out
+}
+
+fn ir_assistant_text_and_reasoning(ir_resp: &ChatResponse) -> (String, String) {
+    ir_resp
+        .choices
+        .first()
+        .map(|c| {
+            (
+                join_text(&c.message.content, "\n"),
+                c.message
+                    .raw
+                    .as_ref()
+                    .map(openai_reasoning_text)
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn anthropic_content_blocks(signature: &str, reasoning_text: String, text: String) -> Value {
+    let mut blocks = Vec::new();
+    if !reasoning_text.is_empty() {
+        blocks.push(json!({
+            "type": "thinking",
+            "thinking": reasoning_text,
+            "signature": signature,
+        }));
+    }
+    if !text.is_empty() || blocks.is_empty() {
+        blocks.push(json!({"type": "text", "text": text}));
+    }
+    Value::Array(blocks)
+}
+
+fn openai_reasoning_text(v: &Value) -> String {
+    ["reasoning_content", "reasoning"]
+        .into_iter()
+        .find_map(|key| {
+            v.get(key)
+                .and_then(|value| value.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+fn map_to_anthropic_stop_reason(reason: Option<&str>) -> String {
+    match reason {
+        Some("length") | Some("max_tokens") => "max_tokens".to_string(),
+        Some("tool_calls") | Some("tool_use") => "tool_use".to_string(),
+        Some("stop_sequence") => "stop_sequence".to_string(),
+        Some("stop") | Some("end_turn") => "end_turn".to_string(),
+        Some(other) => other.to_string(),
+        None => "end_turn".to_string(),
+    }
 }
 
 pub fn ir_to_ollama_downstream_response(ir_resp: &ChatResponse, model: &str) -> Value {

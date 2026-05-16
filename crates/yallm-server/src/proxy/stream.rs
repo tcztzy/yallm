@@ -59,6 +59,7 @@ enum ProviderStreamEvent {
         model: Option<String>,
         prompt_tokens: Option<u32>,
     },
+    ReasoningDelta(String),
     TextDelta(String),
     ToolStart {
         index: u32,
@@ -249,6 +250,14 @@ fn parse_openai_sse_record(data: &str) -> Vec<ProviderStreamEvent> {
         out.push(ProviderStreamEvent::TextDelta(text.to_string()));
     }
 
+    if let Some(reasoning) = choice
+        .and_then(|c| c.get("delta"))
+        .map(openai_delta_reasoning_text)
+        .filter(|s| !s.is_empty())
+    {
+        out.push(ProviderStreamEvent::ReasoningDelta(reasoning));
+    }
+
     if let Some(tool_calls) = choice
         .and_then(|c| c.get("delta"))
         .and_then(|d| d.get("tool_calls"))
@@ -294,6 +303,19 @@ fn parse_openai_sse_record(data: &str) -> Vec<ProviderStreamEvent> {
         });
     }
     out
+}
+
+fn openai_delta_reasoning_text(delta: &Value) -> String {
+    ["reasoning_content", "reasoning"]
+        .into_iter()
+        .find_map(|key| {
+            delta
+                .get(key)
+                .and_then(|value| value.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
 }
 
 fn parse_anthropic_sse_record(event: Option<&str>, data: &str) -> Vec<ProviderStreamEvent> {
@@ -393,6 +415,13 @@ fn parse_anthropic_sse_record(event: Option<&str>, data: &str) -> Vec<ProviderSt
                         })
                         .unwrap_or_default()
                 }
+                "thinking_delta" => v
+                    .get("delta")
+                    .and_then(|d| d.get("thinking"))
+                    .and_then(|t| t.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| vec![ProviderStreamEvent::ReasoningDelta(s.to_string())])
+                    .unwrap_or_default(),
                 _ => Vec::new(),
             })
             .unwrap_or_default(),
@@ -508,6 +537,9 @@ struct DownstreamRenderer {
     completion_tokens: u32,
     openai_role_sent: bool,
     anthropic_message_started: bool,
+    anthropic_thinking_started: bool,
+    anthropic_thinking_closed: bool,
+    anthropic_thinking_index: Option<u32>,
     anthropic_text_started: bool,
     anthropic_text_closed: bool,
     anthropic_text_index: Option<u32>,
@@ -527,6 +559,9 @@ impl DownstreamRenderer {
             completion_tokens: 0,
             openai_role_sent: false,
             anthropic_message_started: false,
+            anthropic_thinking_started: false,
+            anthropic_thinking_closed: false,
+            anthropic_thinking_index: None,
             anthropic_text_started: false,
             anthropic_text_closed: false,
             anthropic_text_index: None,
@@ -562,6 +597,27 @@ impl DownstreamRenderer {
                     self.emit_anthropic_message_start(tx).await;
                 }
             }
+            ProviderStreamEvent::ReasoningDelta(reasoning) => {
+                if reasoning.is_empty() {
+                    return;
+                }
+                match self.protocol {
+                    DownstreamProtocol::OpenAI => {
+                        if !self.openai_role_sent {
+                            self.emit_openai_role_chunk(tx).await;
+                        }
+                        self.emit_openai_reasoning_chunk(reasoning, tx).await;
+                    }
+                    DownstreamProtocol::Anthropic => {
+                        if !self.anthropic_message_started {
+                            self.emit_anthropic_message_start(tx).await;
+                        }
+                        self.emit_anthropic_thinking_start(tx).await;
+                        self.emit_anthropic_thinking_delta(reasoning, tx).await;
+                    }
+                    DownstreamProtocol::Ollama => {}
+                }
+            }
             ProviderStreamEvent::TextDelta(text) => {
                 if text.is_empty() {
                     return;
@@ -577,6 +633,7 @@ impl DownstreamRenderer {
                         if !self.anthropic_message_started {
                             self.emit_anthropic_message_start(tx).await;
                         }
+                        self.close_anthropic_thinking(tx).await;
                         self.emit_anthropic_text_start(tx).await;
                         self.emit_anthropic_content_delta(text, tx).await;
                     }
@@ -616,6 +673,7 @@ impl DownstreamRenderer {
                         if !self.anthropic_message_started {
                             self.emit_anthropic_message_start(tx).await;
                         }
+                        self.close_anthropic_thinking(tx).await;
                         self.emit_anthropic_tool_start(index, tx).await;
                     }
                     DownstreamProtocol::Ollama => {}
@@ -643,6 +701,7 @@ impl DownstreamRenderer {
                         if !self.anthropic_message_started {
                             self.emit_anthropic_message_start(tx).await;
                         }
+                        self.close_anthropic_thinking(tx).await;
                         self.emit_anthropic_tool_start(index, tx).await;
                         self.emit_anthropic_tool_args_delta(index, arguments, tx)
                             .await;
@@ -699,6 +758,7 @@ impl DownstreamRenderer {
                 if !self.anthropic_message_started {
                     self.emit_anthropic_message_start(tx).await;
                 }
+                self.close_anthropic_thinking(tx).await;
                 if self.anthropic_text_started
                     && !self.anthropic_text_closed
                     && let Some(index) = self.anthropic_text_index
@@ -786,6 +846,21 @@ impl DownstreamRenderer {
             "choices": [{
                 "index": 0,
                 "delta": {"content": text},
+                "finish_reason": Value::Null,
+            }]
+        });
+        send_text(tx, sse_data_frame(payload)).await;
+    }
+
+    async fn emit_openai_reasoning_chunk(&self, reasoning: String, tx: &mpsc::Sender<Bytes>) {
+        let payload = json!({
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{
+                "index": 0,
+                "delta": {"reasoning_content": reasoning},
                 "finish_reason": Value::Null,
             }]
         });
@@ -908,6 +983,87 @@ impl DownstreamRenderer {
             ),
         )
         .await;
+    }
+
+    async fn emit_anthropic_thinking_start(&mut self, tx: &mpsc::Sender<Bytes>) {
+        if self.anthropic_thinking_started {
+            return;
+        }
+        self.anthropic_thinking_started = true;
+        self.anthropic_thinking_closed = false;
+        let index = self.anthropic_next_index;
+        self.anthropic_next_index += 1;
+        self.anthropic_thinking_index = Some(index);
+        send_text(
+            tx,
+            sse_event_frame(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "thinking",
+                        "thinking": "",
+                    }
+                }),
+            ),
+        )
+        .await;
+    }
+
+    async fn emit_anthropic_thinking_delta(&self, thinking: String, tx: &mpsc::Sender<Bytes>) {
+        let index = self.anthropic_thinking_index.unwrap_or(0);
+        send_text(
+            tx,
+            sse_event_frame(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "thinking_delta",
+                        "thinking": thinking,
+                    }
+                }),
+            ),
+        )
+        .await;
+    }
+
+    async fn close_anthropic_thinking(&mut self, tx: &mpsc::Sender<Bytes>) {
+        if !self.anthropic_thinking_started || self.anthropic_thinking_closed {
+            return;
+        }
+        let Some(index) = self.anthropic_thinking_index else {
+            return;
+        };
+        send_text(
+            tx,
+            sse_event_frame(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "signature_delta",
+                        "signature": self.id,
+                    }
+                }),
+            ),
+        )
+        .await;
+        send_text(
+            tx,
+            sse_event_frame(
+                "content_block_stop",
+                json!({
+                    "type": "content_block_stop",
+                    "index": index,
+                }),
+            ),
+        )
+        .await;
+        self.anthropic_thinking_closed = true;
     }
 
     async fn emit_anthropic_content_delta(&self, text: String, tx: &mpsc::Sender<Bytes>) {

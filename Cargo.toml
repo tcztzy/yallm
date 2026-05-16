@@ -20,6 +20,7 @@ yallm-ollama = { path = "crates/yallm-ollama" }
 yallm-macros = { path = "crates/yallm-macros" }
 yallm-responses = { path = "crates/yallm-responses" }
 yallm-storage = { path = "crates/yallm-storage" }
+yallm-config = { path = "crates/yallm-config" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

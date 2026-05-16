@@ -162,6 +162,99 @@ async fn anthropic_messages_stream_ok() {
 }
 
 #[tokio::test]
+async fn models_list_default() {
+    let resp = app()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    // Default provider is OpenAI, so expect "object": "list"
+    assert_eq!(v["object"], "list");
+    assert!(v["data"].is_array());
+    assert!(!v["data"].as_array().unwrap().is_empty());
+    assert_eq!(v["data"][0]["object"], "model");
+}
+
+#[tokio::test]
+async fn models_list_openai() {
+    let resp = app()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/models?interface=openai")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(v["object"], "list");
+    assert!(v["data"].is_array());
+    assert!(!v["data"].as_array().unwrap().is_empty());
+    assert_eq!(v["data"][0]["object"], "model");
+    assert_eq!(v["data"][0]["owned_by"], "openai");
+}
+
+#[tokio::test]
+async fn models_list_anthropic() {
+    let resp = app()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/models?interface=anthropic")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    // Anthropic format: top-level "data" array, each has "type": "model"
+    assert!(v["data"].is_array());
+    assert!(!v["data"].as_array().unwrap().is_empty());
+    assert_eq!(v["data"][0]["type"], "model");
+    assert!(v["data"][0]["id"].as_str().unwrap().contains("claude"));
+}
+
+#[tokio::test]
+async fn models_list_invalid_interface_falls_back() {
+    // Unknown interface falls back to default provider (OpenAI)
+    let resp = app()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/models?interface=unknown")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(v["object"], "list");
+}
+
+#[tokio::test]
 async fn ollama_chat_ok() {
     let payload = serde_json::json!({
         "model": "llama3",
