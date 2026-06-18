@@ -2,7 +2,7 @@ use axum::{
     Json,
     body::Body,
     extract::{Path, Query, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -13,7 +13,7 @@ use crate::{
     logging::RequestId,
     proxy::{
         ProviderTarget, ProxyError, call_provider, choose_provider, normalized_openai_url,
-        openai_api_key, should_proxy,
+        should_proxy, upstream_headers,
     },
     state::{AppState, Provider, TransportRequest},
 };
@@ -33,6 +33,7 @@ pub struct GetResponseQuery {
 pub async fn responses_create(
     State(state): State<AppState>,
     axum::extract::Extension(RequestId(request_id)): axum::extract::Extension<RequestId>,
+    headers: HeaderMap,
     Json(req): Json<Value>,
 ) -> impl IntoResponse {
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -65,12 +66,20 @@ pub async fn responses_create(
         && previous_response_id.is_none()
         && context.items.is_empty();
 
-    if should_openai_passthrough && matches!(should_proxy(&state, &target), Ok(true)) {
-        let upstream =
-            match call_openai_post_json(&state, request_id, &target, "/v1/responses", &req).await {
-                Ok(v) => v,
-                Err(resp) => return resp,
-            };
+    if should_openai_passthrough && matches!(should_proxy(&state, &target, &headers), Ok(true)) {
+        let upstream = match call_openai_post_json(
+            &state,
+            request_id,
+            &target,
+            "/v1/responses",
+            &req,
+            &headers,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
 
         let stream_events = if stream {
             yallm_responses::response_to_stream_events(&upstream)
@@ -106,8 +115,8 @@ pub async fn responses_create(
     };
     ir.model = upstream_model.clone();
 
-    let ir_resp = match should_proxy(&state, &target) {
-        Ok(true) => match call_provider(&state, request_id, &target, &ir).await {
+    let ir_resp = match should_proxy(&state, &target, &headers) {
+        Ok(true) => match call_provider(&state, request_id, &target, &ir, &headers).await {
             Ok(resp) => resp,
             Err(err) => return proxy_error_to_response(provider, err),
         },
@@ -227,6 +236,7 @@ pub async fn responses_input_items(
 pub async fn responses_input_tokens(
     State(state): State<AppState>,
     axum::extract::Extension(RequestId(request_id)): axum::extract::Extension<RequestId>,
+    headers: HeaderMap,
     Json(req): Json<Value>,
 ) -> impl IntoResponse {
     if let Some(model) = req.get("model").and_then(Value::as_str) {
@@ -237,7 +247,7 @@ pub async fn responses_input_tokens(
         if provider == Provider::OpenAI
             && convo.is_none()
             && prev.is_none()
-            && matches!(should_proxy(&state, &target), Ok(true))
+            && matches!(should_proxy(&state, &target, &headers), Ok(true))
         {
             match call_openai_post_json(
                 &state,
@@ -245,6 +255,7 @@ pub async fn responses_input_tokens(
                 &target,
                 "/v1/responses/input_tokens",
                 &req,
+                &headers,
             )
             .await
             {
@@ -264,6 +275,7 @@ pub async fn responses_input_tokens(
 pub async fn responses_compact(
     State(state): State<AppState>,
     axum::extract::Extension(RequestId(request_id)): axum::extract::Extension<RequestId>,
+    headers: HeaderMap,
     Json(req): Json<Value>,
 ) -> impl IntoResponse {
     if let Some(model) = req.get("model").and_then(Value::as_str) {
@@ -274,10 +286,17 @@ pub async fn responses_compact(
         if provider == Provider::OpenAI
             && convo.is_none()
             && prev.is_none()
-            && matches!(should_proxy(&state, &target), Ok(true))
+            && matches!(should_proxy(&state, &target, &headers), Ok(true))
         {
-            match call_openai_post_json(&state, request_id, &target, "/v1/responses/compact", &req)
-                .await
+            match call_openai_post_json(
+                &state,
+                request_id,
+                &target,
+                "/v1/responses/compact",
+                &req,
+                &headers,
+            )
+            .await
             {
                 Ok(v) => return (StatusCode::OK, Json(v)).into_response(),
                 Err(resp) => return resp,
@@ -440,21 +459,10 @@ async fn call_openai_post_json(
     target: &ProviderTarget,
     path: &str,
     body: &Value,
+    incoming_headers: &HeaderMap,
 ) -> Result<Value, Response> {
-    let Some(key) = openai_api_key(state, target) else {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": {
-                    "message": "OPENAI_API_KEY is not set",
-                    "type": "server_error"
-                }
-            })),
-        )
-            .into_response());
-    };
-
     let url = normalized_openai_url(state, target, path);
+    state.record_monitor_upstream_url(request_id, &url);
     tracing::info!(
         event = "provider.out",
         request_id,
@@ -476,7 +484,7 @@ async fn call_openai_post_json(
         .send(TransportRequest {
             method: "POST",
             url: url.clone(),
-            headers: vec![("authorization".to_string(), format!("Bearer {key}"))],
+            headers: upstream_headers(state, target, incoming_headers),
             body: upstream_body,
         })
         .await

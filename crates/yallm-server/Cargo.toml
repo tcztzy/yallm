@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 description = "HTTP server for yallm LLM API conversion proxy"
 
 [dependencies]

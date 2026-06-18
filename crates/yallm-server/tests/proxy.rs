@@ -1,4 +1,9 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     body::{Body, to_bytes},
@@ -22,9 +27,11 @@ struct MockTransport {
 
 fn state_from_litellm_config(
     config: &str,
-    env: HashMap<String, String>,
+    mut env: HashMap<String, String>,
     transport: MockTransport,
 ) -> yallm_server::AppState {
+    env.entry(yallm_storage::DB_URL_ENV.to_string())
+        .or_insert_with(|| temp_db_url("proxy-litellm"));
     let mut warnings = Vec::new();
     let litellm_models = yallm_config::parse_litellm_config_str(config, &env, &mut warnings);
     let mut state = yallm_server::AppState::from_loaded_config(yallm_config::LoadedConfig {
@@ -35,6 +42,31 @@ fn state_from_litellm_config(
     state.transport = Arc::new(transport);
     state.mode = yallm_server::Mode::Proxy;
     state
+}
+
+fn state_with_temp_store(name: &str) -> yallm_server::AppState {
+    let mut env = HashMap::new();
+    env.insert(yallm_storage::DB_URL_ENV.to_string(), temp_db_url(name));
+    yallm_server::AppState::from_loaded_config(yallm_config::LoadedConfig {
+        env,
+        litellm_models: Vec::new(),
+        warnings: Vec::new(),
+    })
+}
+
+fn temp_store_path(name: &str) -> PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!("yallm-proxy-test-{name}-{ts}.json"))
+}
+
+fn temp_db_url(name: &str) -> String {
+    format!(
+        "sqlite://{}",
+        temp_store_path(name).with_extension("sqlite3").display()
+    )
 }
 
 impl yallm_server::Transport for MockTransport {
@@ -458,6 +490,79 @@ model_list:
 }
 
 #[tokio::test]
+async fn request_headers_override_route_headers_and_use_route_allowlist() {
+    let cap = Arc::new(TransportCapture::default());
+    let transport = MockTransport { cap: cap.clone() };
+    let mut env = HashMap::new();
+    env.insert("ROUTE_TOKEN".to_string(), "route_token".to_string());
+    let state = state_from_litellm_config(
+        r#"
+model_list:
+  - model_name: gpt-headered
+    yallm_params:
+      provider: openai
+      model: real-gpt
+      api_base: http://openai.test/v1
+      headers:
+        Authorization: Bearer ${ROUTE_TOKEN}
+        x-route-header: route-value
+      forward_headers:
+        - authorization
+        - x-request-id
+"#,
+        env,
+        transport,
+    );
+    let app = yallm_server::app_with_state(state);
+
+    let payload = json!({
+        "model": "gpt-headered",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer request_token")
+                .header("x-request-id", "req-123")
+                .header("x-not-forwarded", "drop-me")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let reqs = cap.requests.lock().await;
+    assert_eq!(reqs.len(), 1);
+    assert!(
+        reqs[0].headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("authorization") && v == "Bearer request_token"
+        })
+    );
+    assert!(
+        reqs[0]
+            .headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("x-route-header") && v == "route-value")
+    );
+    assert!(
+        reqs[0]
+            .headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("x-request-id") && v == "req-123")
+    );
+    assert!(
+        !reqs[0]
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("x-not-forwarded"))
+    );
+}
+
+#[tokio::test]
 async fn litellm_anthropic_alias_routes_with_env_key() {
     let cap = Arc::new(TransportCapture::default());
     let transport = MockTransport { cap: cap.clone() };
@@ -513,6 +618,97 @@ model_list:
             .headers
             .iter()
             .any(|(k, v)| k.eq_ignore_ascii_case("anthropic-version") && v == "2024-01-01")
+    );
+}
+
+#[tokio::test]
+async fn anthropic_auth_token_routes_as_authorization_header() {
+    let cap = Arc::new(TransportCapture::default());
+    let transport = MockTransport { cap: cap.clone() };
+
+    let mut state = yallm_server::AppState {
+        transport: Arc::new(transport),
+        mode: yallm_server::Mode::Proxy,
+        ..state_with_temp_store("proxy")
+    };
+    state.provider.anthropic_auth_token = Some("test_auth_token".to_string());
+    state.provider.anthropic_base_url = "http://anthropic.test".to_string();
+
+    let app = yallm_server::app_with_state(state);
+    let payload = json!({
+        "model": "anthropic:claude-3-haiku-20240307",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let reqs = cap.requests.lock().await;
+    assert_eq!(reqs.len(), 1);
+    assert!(reqs[0].headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("authorization") && v == "Bearer test_auth_token"
+    }));
+    assert!(
+        !reqs[0]
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("x-api-key"))
+    );
+}
+
+#[tokio::test]
+async fn request_auth_header_replaces_configured_anthropic_api_key() {
+    let cap = Arc::new(TransportCapture::default());
+    let transport = MockTransport { cap: cap.clone() };
+
+    let mut state = yallm_server::AppState {
+        transport: Arc::new(transport),
+        mode: yallm_server::Mode::Proxy,
+        ..state_with_temp_store("proxy")
+    };
+    state.provider.anthropic_api_key = Some("configured_key".to_string());
+    state.provider.anthropic_base_url = "http://anthropic.test".to_string();
+
+    let app = yallm_server::app_with_state(state);
+    let payload = json!({
+        "model": "anthropic:claude-3-haiku-20240307",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer request_token")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let reqs = cap.requests.lock().await;
+    assert_eq!(reqs.len(), 1);
+    assert!(
+        reqs[0].headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("authorization") && v == "Bearer request_token"
+        })
+    );
+    assert!(
+        !reqs[0]
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("x-api-key"))
     );
 }
 
@@ -691,7 +887,7 @@ async fn proxies_openai_to_openai_upstream_without_network() {
     let mut state = yallm_server::AppState {
         transport: Arc::new(transport),
         mode: yallm_server::Mode::Proxy,
-        ..Default::default()
+        ..state_with_temp_store("proxy")
     };
     state.provider.openai_api_key = Some("test_openai_key".to_string());
     state.provider.openai_base_url = "http://openai.test".to_string();
@@ -741,7 +937,7 @@ async fn maps_openai_reasoning_to_anthropic_thinking_without_network() {
     let mut state = yallm_server::AppState {
         transport: Arc::new(transport),
         mode: yallm_server::Mode::Proxy,
-        ..Default::default()
+        ..state_with_temp_store("proxy")
     };
     state.provider.openai_api_key = Some("test_openai_key".to_string());
     state.provider.openai_base_url = "http://openai.test".to_string();
@@ -784,7 +980,7 @@ async fn proxies_openai_to_anthropic_upstream_without_network() {
     let mut state = yallm_server::AppState {
         transport: Arc::new(transport),
         mode: yallm_server::Mode::Proxy,
-        ..Default::default()
+        ..state_with_temp_store("proxy")
     };
     state.provider.anthropic_api_key = Some("test_anthropic_key".to_string());
     state.provider.anthropic_base_url = "http://anthropic.test".to_string();
@@ -844,7 +1040,7 @@ async fn proxies_streaming_openai_to_anthropic_upstream_without_network() {
     let mut state = yallm_server::AppState {
         transport: Arc::new(transport),
         mode: yallm_server::Mode::Proxy,
-        ..Default::default()
+        ..state_with_temp_store("proxy")
     };
     state.provider.anthropic_api_key = Some("test_anthropic_key".to_string());
     state.provider.anthropic_base_url = "http://anthropic.test".to_string();
@@ -897,7 +1093,7 @@ async fn maps_streaming_tool_calls_anthropic_to_openai() {
     let mut state = yallm_server::AppState {
         transport: Arc::new(transport),
         mode: yallm_server::Mode::Proxy,
-        ..Default::default()
+        ..state_with_temp_store("proxy")
     };
     state.provider.anthropic_api_key = Some("test_anthropic_key".to_string());
     state.provider.anthropic_base_url = "http://anthropic.test".to_string();
@@ -939,7 +1135,7 @@ async fn maps_streaming_tool_calls_openai_to_anthropic() {
     let mut state = yallm_server::AppState {
         transport: Arc::new(transport),
         mode: yallm_server::Mode::Proxy,
-        ..Default::default()
+        ..state_with_temp_store("proxy")
     };
     state.provider.openai_api_key = Some("test_openai_key".to_string());
     state.provider.openai_base_url = "http://openai.test".to_string();
@@ -982,7 +1178,7 @@ async fn maps_streaming_openai_reasoning_to_anthropic_thinking() {
     let mut state = yallm_server::AppState {
         transport: Arc::new(transport),
         mode: yallm_server::Mode::Proxy,
-        ..Default::default()
+        ..state_with_temp_store("proxy")
     };
     state.provider.openai_api_key = Some("test_openai_key".to_string());
     state.provider.openai_base_url = "http://openai.test".to_string();

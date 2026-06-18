@@ -7,7 +7,7 @@ use yallm_ir::{
 };
 
 yallm_macros::include_openapi! {
-    local_file = "../yallm-openai/openapi.documented.yml",
+    local_file = "openapi.documented.yml",
     root_types = [
         "CreateResponse",
         "Response",

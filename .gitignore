@@ -1,9 +1,12 @@
 __pycache__/
 .coverage
 target/
+node_modules/
+.playwright-mcp/
 python/yallm-*.data/
 .venv/
 .agents/
 .claude/
+.yallm/
 .yallm/secrets.toml
 .yallm/*.local.toml

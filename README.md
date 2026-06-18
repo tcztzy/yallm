@@ -102,7 +102,7 @@ Anthropic with model `claude-3-haiku-20240307`).
 
 `YALLM_MODE` controls behavior when provider configuration is missing:
 - `auto` (default): proxy if configured, otherwise return deterministic mock responses
-- `proxy`: always proxy (missing config returns an error)
+- `proxy`: always proxy; if no auth/header is supplied, the upstream decides whether to reject it
 - `mock`: always mock (never calls upstream)
 
 ### Configuration Layers
@@ -127,19 +127,39 @@ YALLM_DEFAULT_PROVIDER = "anthropic"
 ### Provider Environment Variables
 
 OpenAI:
-- `OPENAI_API_KEY` (required for proxying)
+- `OPENAI_API_KEY` (compatibility sugar for `Authorization: Bearer <key>`)
 - `OPENAI_BASE_URL` (default `https://api.openai.com`)
+- `YALLM_OPENAI_HEADERS` (optional JSON object of additional upstream headers)
 
 Anthropic:
-- `ANTHROPIC_API_KEY` (required for proxying; or `ANTHROPIC_AUTH_TOKEN` for bearer-token gateways)
+- `ANTHROPIC_API_KEY` (compatibility sugar for `x-api-key: <key>`)
+- `ANTHROPIC_AUTH_TOKEN` (compatibility sugar for `Authorization: Bearer <token>`)
 - `ANTHROPIC_BASE_URL` (default `https://api.anthropic.com`)
 - `ANTHROPIC_VERSION` (default `2023-06-01`)
+- `YALLM_ANTHROPIC_HEADERS` (optional JSON object of additional upstream headers)
 
 Ollama:
 - `OLLAMA_BASE_URL` (default `http://localhost:11434`)
+- `YALLM_OLLAMA_HEADERS` (optional JSON object of additional upstream headers)
+
+`YALLM_*_HEADERS` values may use `os.environ/VAR` or `${VAR}` references, including interpolation
+such as `"Authorization": "Bearer ${UPSTREAM_TOKEN}"`.
+
+Request header forwarding:
+- `YALLM_FORWARD_HEADERS` controls which downstream request headers may be forwarded upstream.
+  Defaults to common provider headers:
+  `authorization,x-api-key,api-key,openai-organization,openai-project,anthropic-version,anthropic-beta`.
+  Set it to `none` to disable request header forwarding.
+- Header precedence is: provider env/default headers, then model-route headers, then allowlisted request
+  headers. If a higher-priority source supplies an auth header (`authorization`, `x-api-key`, or
+  `api-key`), lower-priority auth headers are dropped.
 
 Local storage:
-- `YALLM_STORAGE_PATH` (optional): local JSON file path for persisted responses/conversations history.
+- `YALLM_DB_URL` (optional): persistent database URL for responses, conversations, and dashboard
+  monitoring events. Defaults to `sqlite://<cache-dir>/yallm/storage.sqlite3`.
+- Supported URL schemes are currently `sqlite://`, `sqlite::memory:`, `file://`, and bare file
+  paths. Other database URL schemes fail explicitly until a backend is added in `yallm-storage`.
+- `YALLM_STORAGE_PATH` is a deprecated compatibility path for the old local JSON store.
 
 ### LiteLLM Config Compatibility
 
@@ -167,22 +187,30 @@ model_list:
       model: gpt-4o
       api_base: https://openai-compatible.example/v1
       api_key: os.environ/OPENAI_API_KEY
+      headers:
+        OpenAI-Organization: ${OPENAI_ORG_ID}
+      forward_headers:
+        - authorization
+        - x-request-id
 
   - model_name: claude-alias         # legacy LiteLLM-style entry still works
     litellm_params:
       model: anthropic/claude-3-haiku-20240307
       api_key: os.environ/ANTHROPIC_API_KEY
+      headers:
+        anthropic-beta: prompt-caching-2024-07-31
 ```
 
 Supported `litellm_params` v1 fields: `model_name` and
-`litellm_params.model/api_base/api_key/api_version/custom_llm_provider` for
+`litellm_params.model/api_base/api_key/api_version/custom_llm_provider/headers/forward_headers` for
 OpenAI-compatible, Anthropic, and Ollama upstreams. Exact aliases take priority
 over prefix/default-provider routing. Advanced LiteLLM router features,
 fallback rules, budgets, wildcard model groups, and Azure OpenAI routing are
 not implemented.
 
 Use env references for keys instead of committing secrets — both
-`os.environ/VAR` and `${VAR}` syntaxes are accepted.
+`os.environ/VAR` and `${VAR}` syntaxes are accepted. Header values additionally support interpolation,
+for example `Authorization: Bearer ${UPSTREAM_TOKEN}`.
 
 ### Logging (Fluentd-Friendly JSON)
 

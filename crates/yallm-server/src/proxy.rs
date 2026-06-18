@@ -1,5 +1,6 @@
 use std::{convert::Infallible, pin::Pin, time::Instant};
 
+use axum::http::HeaderMap;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use serde_json::{Value, json};
@@ -7,7 +8,10 @@ use yallm_ir::{ChatRequest, ChatResponse, Choice, Content, Message, Role, Source
 
 use crate::{
     logging::redact_json_secrets,
-    state::{AppState, Mode, ModelRoute, Provider, TransportByteStream, TransportRequest},
+    state::{
+        AppState, DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_OPENAI_BASE_URL, Mode, ModelRoute, Provider,
+        TransportByteStream, TransportRequest,
+    },
 };
 
 mod stream;
@@ -64,33 +68,47 @@ pub fn choose_provider(state: &AppState, model: &str) -> ProviderTarget {
     }
 }
 
-pub fn should_proxy(state: &AppState, target: &ProviderTarget) -> Result<bool, ProxyError> {
+pub fn should_proxy(
+    state: &AppState,
+    target: &ProviderTarget,
+    incoming_headers: &HeaderMap,
+) -> Result<bool, ProxyError> {
     match state.mode {
         Mode::Mock => Ok(false),
-        Mode::Auto => Ok(provider_is_configured(state, target)),
-        Mode::Proxy => {
-            if provider_is_configured(state, target) {
-                Ok(true)
-            } else {
-                Err(ProxyError {
-                    status: 500,
-                    message: format!(
-                        "Missing configuration for provider {} (set required env vars)",
-                        target.provider.as_str()
-                    ),
-                    upstream_body: None,
-                })
-            }
-        }
+        Mode::Auto => Ok(provider_is_configured(state, target, incoming_headers)),
+        Mode::Proxy => Ok(true),
     }
 }
 
-fn provider_is_configured(state: &AppState, target: &ProviderTarget) -> bool {
+fn provider_is_configured(
+    state: &AppState,
+    target: &ProviderTarget,
+    incoming_headers: &HeaderMap,
+) -> bool {
+    if !forwarded_request_headers(state, target, incoming_headers).is_empty() {
+        return true;
+    }
+
+    if let Some(route) = &target.route
+        && (route.api_base.is_some()
+            || route.api_key.is_some()
+            || route.api_version.is_some()
+            || !route.headers.is_empty())
+    {
+        return true;
+    }
+
     match target.provider {
-        Provider::OpenAI => openai_api_key(state, target).is_some(),
+        Provider::OpenAI => {
+            state.provider.openai_api_key.is_some()
+                || !state.provider.openai_headers.is_empty()
+                || state.provider.openai_base_url != DEFAULT_OPENAI_BASE_URL
+        }
         Provider::Anthropic => {
-            anthropic_api_key(state, target).is_some()
+            state.provider.anthropic_api_key.is_some()
                 || state.provider.anthropic_auth_token.is_some()
+                || !state.provider.anthropic_headers.is_empty()
+                || state.provider.anthropic_base_url != DEFAULT_ANTHROPIC_BASE_URL
         }
         Provider::Ollama => true, // base_url is always present; Ollama typically does not need a key
     }
@@ -101,11 +119,14 @@ pub async fn call_provider(
     request_id: u64,
     target: &ProviderTarget,
     ir: &ChatRequest,
+    incoming_headers: &HeaderMap,
 ) -> Result<ChatResponse, ProxyError> {
     match target.provider {
-        Provider::OpenAI => call_openai(state, request_id, target, ir).await,
-        Provider::Anthropic => call_anthropic(state, request_id, target, ir).await,
-        Provider::Ollama => call_ollama(state, request_id, target, ir).await,
+        Provider::OpenAI => call_openai(state, request_id, target, ir, incoming_headers).await,
+        Provider::Anthropic => {
+            call_anthropic(state, request_id, target, ir, incoming_headers).await
+        }
+        Provider::Ollama => call_ollama(state, request_id, target, ir, incoming_headers).await,
     }
 }
 
@@ -129,11 +150,18 @@ pub async fn call_provider_stream(
     request_id: u64,
     target: &ProviderTarget,
     ir: &ChatRequest,
+    incoming_headers: &HeaderMap,
 ) -> Result<ProviderStream, ProxyError> {
     match target.provider {
-        Provider::OpenAI => call_openai_stream(state, request_id, target, ir).await,
-        Provider::Anthropic => call_anthropic_stream(state, request_id, target, ir).await,
-        Provider::Ollama => call_ollama_stream(state, request_id, target, ir).await,
+        Provider::OpenAI => {
+            call_openai_stream(state, request_id, target, ir, incoming_headers).await
+        }
+        Provider::Anthropic => {
+            call_anthropic_stream(state, request_id, target, ir, incoming_headers).await
+        }
+        Provider::Ollama => {
+            call_ollama_stream(state, request_id, target, ir, incoming_headers).await
+        }
     }
 }
 
@@ -161,28 +189,12 @@ pub fn normalized_openai_url(state: &AppState, target: &ProviderTarget, path: &s
     )
 }
 
-fn anthropic_api_key(state: &AppState, target: &ProviderTarget) -> Option<String> {
-    target
-        .route
-        .as_ref()
-        .and_then(|route| route.api_key.clone())
-        .or_else(|| state.provider.anthropic_api_key.clone())
-}
-
 fn anthropic_base_url(state: &AppState, target: &ProviderTarget) -> String {
     target
         .route
         .as_ref()
         .and_then(|route| route.api_base.clone())
         .unwrap_or_else(|| state.provider.anthropic_base_url.clone())
-}
-
-fn anthropic_version(state: &AppState, target: &ProviderTarget) -> String {
-    target
-        .route
-        .as_ref()
-        .and_then(|route| route.api_version.clone())
-        .unwrap_or_else(|| state.provider.anthropic_version.clone())
 }
 
 fn ollama_base_url(state: &AppState, target: &ProviderTarget) -> String {
@@ -220,25 +232,166 @@ fn redact_headers(headers: &[(String, String)]) -> Value {
     Value::Object(obj)
 }
 
+pub(crate) fn upstream_headers(
+    state: &AppState,
+    target: &ProviderTarget,
+    incoming_headers: &HeaderMap,
+) -> Vec<(String, String)> {
+    let mut headers = Vec::new();
+    merge_header_source(&mut headers, provider_default_headers(state, target));
+    merge_header_source(&mut headers, route_headers(target));
+    merge_header_source(
+        &mut headers,
+        forwarded_request_headers(state, target, incoming_headers),
+    );
+    headers
+}
+
+fn provider_default_headers(state: &AppState, target: &ProviderTarget) -> Vec<(String, String)> {
+    match target.provider {
+        Provider::OpenAI => {
+            let mut headers = Vec::new();
+            if let Some(key) = state.provider.openai_api_key.clone() {
+                headers.push(("authorization".to_string(), format!("Bearer {key}")));
+            }
+            headers.extend(state.provider.openai_headers.clone());
+            headers
+        }
+        Provider::Anthropic => {
+            let mut headers = vec![(
+                "anthropic-version".to_string(),
+                state.provider.anthropic_version.clone(),
+            )];
+            if let Some(key) = state.provider.anthropic_api_key.clone() {
+                headers.push(("x-api-key".to_string(), key));
+            } else if let Some(token) = state.provider.anthropic_auth_token.clone() {
+                headers.push(("authorization".to_string(), format!("Bearer {token}")));
+            }
+            headers.extend(state.provider.anthropic_headers.clone());
+            headers
+        }
+        Provider::Ollama => state.provider.ollama_headers.clone(),
+    }
+}
+
+fn route_headers(target: &ProviderTarget) -> Vec<(String, String)> {
+    let Some(route) = &target.route else {
+        return Vec::new();
+    };
+
+    let mut headers = Vec::new();
+    match target.provider {
+        Provider::OpenAI => {
+            if let Some(key) = route.api_key.clone() {
+                headers.push(("authorization".to_string(), format!("Bearer {key}")));
+            }
+        }
+        Provider::Anthropic => {
+            if let Some(version) = route.api_version.clone() {
+                headers.push(("anthropic-version".to_string(), version));
+            }
+            if let Some(key) = route.api_key.clone() {
+                headers.push(("x-api-key".to_string(), key));
+            }
+        }
+        Provider::Ollama => {}
+    }
+    headers.extend(route.headers.clone());
+    headers
+}
+
+fn forwarded_request_headers(
+    state: &AppState,
+    target: &ProviderTarget,
+    incoming_headers: &HeaderMap,
+) -> Vec<(String, String)> {
+    let allowlist = forward_header_allowlist(state, target);
+    let mut headers = Vec::new();
+    for (name, value) in incoming_headers {
+        let name = name.as_str().to_ascii_lowercase();
+        if !allowlist.contains(&name) || !is_forwardable_header(&name) {
+            continue;
+        }
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        headers.push((name, value.to_string()));
+    }
+    headers
+}
+
+fn forward_header_allowlist(state: &AppState, target: &ProviderTarget) -> Vec<String> {
+    let mut allowlist = state.provider.forward_headers.clone();
+    if let Some(route) = &target.route {
+        for header in &route.forward_headers {
+            if !allowlist
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(header))
+            {
+                allowlist.push(header.to_ascii_lowercase());
+            }
+        }
+    }
+    allowlist
+}
+
+fn merge_header_source(headers: &mut Vec<(String, String)>, source: Vec<(String, String)>) {
+    if source.iter().any(|(name, _)| is_auth_header(name)) {
+        headers.retain(|(name, _)| !is_auth_header(name));
+    }
+    for (name, value) in source {
+        insert_or_replace_header(headers, name, value);
+    }
+}
+
+fn insert_or_replace_header(headers: &mut Vec<(String, String)>, name: String, value: String) {
+    if let Some((existing_name, existing_value)) = headers
+        .iter_mut()
+        .find(|(existing_name, _)| existing_name.eq_ignore_ascii_case(&name))
+    {
+        *existing_name = name;
+        *existing_value = value;
+    } else {
+        headers.push((name, value));
+    }
+}
+
+fn is_auth_header(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "authorization" | "x-api-key" | "api-key"
+    )
+}
+
+fn is_forwardable_header(name: &str) -> bool {
+    !matches!(
+        name,
+        "connection"
+            | "content-length"
+            | "host"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
 async fn call_openai(
     state: &AppState,
     request_id: u64,
     target: &ProviderTarget,
     ir: &ChatRequest,
+    incoming_headers: &HeaderMap,
 ) -> Result<ChatResponse, ProxyError> {
-    let Some(key) = openai_api_key(state, target) else {
-        return Err(ProxyError {
-            status: 500,
-            message: "OPENAI_API_KEY is not set".to_string(),
-            upstream_body: None,
-        });
-    };
-
     let url = normalized_openai_url(state, target, "/v1/chat/completions");
     let body = ir_to_openai_request_json(ir);
     let started = Instant::now();
 
-    let headers = vec![("authorization".to_string(), format!("Bearer {key}"))];
+    let headers = upstream_headers(state, target, incoming_headers);
+    state.record_monitor_upstream_url(request_id, &url);
 
     tracing::info!(
         event = "provider.out",
@@ -297,6 +450,7 @@ async fn call_anthropic(
     request_id: u64,
     target: &ProviderTarget,
     ir: &ChatRequest,
+    incoming_headers: &HeaderMap,
 ) -> Result<ChatResponse, ProxyError> {
     let url = format!(
         "{}/v1/messages",
@@ -305,22 +459,8 @@ async fn call_anthropic(
     let body = ir_to_anthropic_request_json(ir);
     let started = Instant::now();
 
-    let mut headers = vec![(
-        "anthropic-version".to_string(),
-        anthropic_version(state, target),
-    )];
-
-    if let Some(key) = anthropic_api_key(state, target) {
-        headers.push(("x-api-key".to_string(), key));
-    } else if let Some(token) = state.provider.anthropic_auth_token.clone() {
-        headers.push(("authorization".to_string(), format!("Bearer {token}")));
-    } else {
-        return Err(ProxyError {
-            status: 500,
-            message: "ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is not set".to_string(),
-            upstream_body: None,
-        });
-    }
+    let headers = upstream_headers(state, target, incoming_headers);
+    state.record_monitor_upstream_url(request_id, &url);
 
     tracing::info!(
         event = "provider.out",
@@ -379,6 +519,7 @@ async fn call_ollama(
     request_id: u64,
     target: &ProviderTarget,
     ir: &ChatRequest,
+    incoming_headers: &HeaderMap,
 ) -> Result<ChatResponse, ProxyError> {
     let url = format!(
         "{}/api/chat",
@@ -386,6 +527,7 @@ async fn call_ollama(
     );
     let body = ir_to_ollama_request_json(ir);
     let started = Instant::now();
+    state.record_monitor_upstream_url(request_id, &url);
 
     tracing::info!(
         event = "provider.out",
@@ -401,7 +543,7 @@ async fn call_ollama(
         .send(TransportRequest {
             method: "POST",
             url: url.clone(),
-            headers: Vec::new(),
+            headers: upstream_headers(state, target, incoming_headers),
             body: body.clone(),
         })
         .await
@@ -444,19 +586,13 @@ async fn call_openai_stream(
     request_id: u64,
     target: &ProviderTarget,
     ir: &ChatRequest,
+    incoming_headers: &HeaderMap,
 ) -> Result<ProviderStream, ProxyError> {
-    let Some(key) = openai_api_key(state, target) else {
-        return Err(ProxyError {
-            status: 500,
-            message: "OPENAI_API_KEY is not set".to_string(),
-            upstream_body: None,
-        });
-    };
-
     let url = normalized_openai_url(state, target, "/v1/chat/completions");
     let body = with_stream_flag(ir_to_openai_request_json(ir), true);
     let started = Instant::now();
-    let headers = vec![("authorization".to_string(), format!("Bearer {key}"))];
+    let headers = upstream_headers(state, target, incoming_headers);
+    state.record_monitor_upstream_url(request_id, &url);
 
     tracing::info!(
         event = "provider.out",
@@ -511,6 +647,7 @@ async fn call_anthropic_stream(
     request_id: u64,
     target: &ProviderTarget,
     ir: &ChatRequest,
+    incoming_headers: &HeaderMap,
 ) -> Result<ProviderStream, ProxyError> {
     let url = format!(
         "{}/v1/messages",
@@ -519,22 +656,8 @@ async fn call_anthropic_stream(
     let body = with_stream_flag(ir_to_anthropic_request_json(ir), true);
     let started = Instant::now();
 
-    let mut headers = vec![(
-        "anthropic-version".to_string(),
-        anthropic_version(state, target),
-    )];
-
-    if let Some(key) = anthropic_api_key(state, target) {
-        headers.push(("x-api-key".to_string(), key));
-    } else if let Some(token) = state.provider.anthropic_auth_token.clone() {
-        headers.push(("authorization".to_string(), format!("Bearer {token}")));
-    } else {
-        return Err(ProxyError {
-            status: 500,
-            message: "ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is not set".to_string(),
-            upstream_body: None,
-        });
-    }
+    let headers = upstream_headers(state, target, incoming_headers);
+    state.record_monitor_upstream_url(request_id, &url);
 
     tracing::info!(
         event = "provider.out",
@@ -589,6 +712,7 @@ async fn call_ollama_stream(
     request_id: u64,
     target: &ProviderTarget,
     ir: &ChatRequest,
+    incoming_headers: &HeaderMap,
 ) -> Result<ProviderStream, ProxyError> {
     let url = format!(
         "{}/api/chat",
@@ -596,6 +720,7 @@ async fn call_ollama_stream(
     );
     let body = with_stream_flag(ir_to_ollama_request_json(ir), true);
     let started = Instant::now();
+    state.record_monitor_upstream_url(request_id, &url);
 
     tracing::info!(
         event = "provider.out",
@@ -611,7 +736,7 @@ async fn call_ollama_stream(
         .send_stream(TransportRequest {
             method: "POST",
             url: url.clone(),
-            headers: Vec::new(),
+            headers: upstream_headers(state, target, incoming_headers),
             body: body.clone(),
         })
         .await

@@ -9,7 +9,7 @@ use axum::{
     Json,
     body::Body,
     extract::{Query, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -158,6 +158,7 @@ fn ndjson_stream_response(stream: DownstreamByteStream) -> Response {
 pub async fn chat_completions(
     State(state): State<AppState>,
     axum::extract::Extension(RequestId(request_id)): axum::extract::Extension<RequestId>,
+    headers: HeaderMap,
     Json(req): Json<Value>,
 ) -> impl IntoResponse {
     let stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -211,10 +212,10 @@ pub async fn chat_completions(
         model = %ir.model
     );
 
-    match should_proxy(&state, &target) {
+    match should_proxy(&state, &target, &headers) {
         Ok(true) => {
             if stream {
-                match call_provider_stream(&state, request_id, &target, &ir).await {
+                match call_provider_stream(&state, request_id, &target, &ir, &headers).await {
                     Ok(stream_resp) => {
                         tracing::info!(
                             event = "convert.provider_to_ir_stream",
@@ -237,7 +238,7 @@ pub async fn chat_completions(
                     Err(e) => proxy_error_to_response(provider, e).into_response(),
                 }
             } else {
-                match call_provider(&state, request_id, &target, &ir).await {
+                match call_provider(&state, request_id, &target, &ir, &headers).await {
                     Ok(ir_resp) => {
                         tracing::info!(
                             event = "convert.provider_to_ir",
@@ -276,6 +277,7 @@ pub async fn chat_completions(
 pub async fn anthropic_messages(
     State(state): State<AppState>,
     axum::extract::Extension(RequestId(request_id)): axum::extract::Extension<RequestId>,
+    headers: HeaderMap,
     Json(req): Json<Value>,
 ) -> impl IntoResponse {
     let stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -329,10 +331,10 @@ pub async fn anthropic_messages(
         model = %ir.model
     );
 
-    match should_proxy(&state, &target) {
+    match should_proxy(&state, &target, &headers) {
         Ok(true) => {
             if stream {
-                match call_provider_stream(&state, request_id, &target, &ir).await {
+                match call_provider_stream(&state, request_id, &target, &ir, &headers).await {
                     Ok(stream_resp) => {
                         tracing::info!(
                             event = "convert.provider_to_ir_stream",
@@ -355,7 +357,7 @@ pub async fn anthropic_messages(
                     Err(e) => proxy_error_to_response(provider, e).into_response(),
                 }
             } else {
-                match call_provider(&state, request_id, &target, &ir).await {
+                match call_provider(&state, request_id, &target, &ir, &headers).await {
                     Ok(ir_resp) => {
                         tracing::info!(
                             event = "convert.provider_to_ir",
@@ -393,6 +395,7 @@ pub async fn anthropic_messages(
 pub async fn ollama_chat(
     State(state): State<AppState>,
     axum::extract::Extension(RequestId(request_id)): axum::extract::Extension<RequestId>,
+    headers: HeaderMap,
     Json(req): Json<Value>,
 ) -> impl IntoResponse {
     let stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -446,10 +449,10 @@ pub async fn ollama_chat(
         model = %ir.model
     );
 
-    match should_proxy(&state, &target) {
+    match should_proxy(&state, &target, &headers) {
         Ok(true) => {
             if stream {
-                match call_provider_stream(&state, request_id, &target, &ir).await {
+                match call_provider_stream(&state, request_id, &target, &ir, &headers).await {
                     Ok(stream_resp) => {
                         tracing::info!(
                             event = "convert.provider_to_ir_stream",
@@ -472,7 +475,7 @@ pub async fn ollama_chat(
                     Err(e) => proxy_error_to_response(provider, e).into_response(),
                 }
             } else {
-                match call_provider(&state, request_id, &target, &ir).await {
+                match call_provider(&state, request_id, &target, &ir, &headers).await {
                     Ok(ir_resp) => {
                         tracing::info!(
                             event = "convert.provider_to_ir",

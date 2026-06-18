@@ -1,4 +1,9 @@
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     body::{Body, to_bytes},
@@ -79,11 +84,36 @@ fn app_with_mode(mode: EdgeMode) -> axum::Router {
     let mut state = yallm_server::AppState {
         transport: Arc::new(EdgeTransport { mode }),
         mode: yallm_server::Mode::Proxy,
-        ..Default::default()
+        ..state_with_temp_store("proxy-edge")
     };
     state.provider.openai_api_key = Some("test_openai_key".to_string());
     state.provider.openai_base_url = "http://openai.test".to_string();
     yallm_server::app_with_state(state)
+}
+
+fn state_with_temp_store(name: &str) -> yallm_server::AppState {
+    let mut env = HashMap::new();
+    env.insert(yallm_storage::DB_URL_ENV.to_string(), temp_db_url(name));
+    yallm_server::AppState::from_loaded_config(yallm_config::LoadedConfig {
+        env,
+        litellm_models: Vec::new(),
+        warnings: Vec::new(),
+    })
+}
+
+fn temp_store_path(name: &str) -> PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!("yallm-proxy-edge-test-{name}-{ts}.json"))
+}
+
+fn temp_db_url(name: &str) -> String {
+    format!(
+        "sqlite://{}",
+        temp_store_path(name).with_extension("sqlite3").display()
+    )
 }
 
 #[tokio::test]

@@ -8,19 +8,20 @@ edition = "2024"
 authors = ["Tang Ziya <tcztzy@gmail.com>"]
 license = "MIT"
 repository = "https://github.com/tcztzy/yallm"
+publish = ["crates-io"]
 
 [workspace.dependencies]
 # Internal crates
-yallm-ir = { path = "crates/yallm-ir" }
-yallm-cli = { path = "crates/yallm-cli" }
-yallm-server = { path = "crates/yallm-server" }
-yallm-openai = { path = "crates/yallm-openai" }
-yallm-anthropic = { path = "crates/yallm-anthropic" }
-yallm-ollama = { path = "crates/yallm-ollama" }
-yallm-macros = { path = "crates/yallm-macros" }
-yallm-responses = { path = "crates/yallm-responses" }
-yallm-storage = { path = "crates/yallm-storage" }
-yallm-config = { path = "crates/yallm-config" }
+yallm-ir = { version = "0.1.0", path = "crates/yallm-ir" }
+yallm-cli = { version = "0.1.0", path = "crates/yallm-cli" }
+yallm-server = { version = "0.1.0", path = "crates/yallm-server" }
+yallm-openai = { version = "0.1.0", path = "crates/yallm-openai" }
+yallm-anthropic = { version = "0.1.0", path = "crates/yallm-anthropic" }
+yallm-ollama = { version = "0.1.0", path = "crates/yallm-ollama" }
+yallm-macros = { version = "0.1.0", path = "crates/yallm-macros" }
+yallm-responses = { version = "0.1.0", path = "crates/yallm-responses" }
+yallm-storage = { version = "0.1.0", path = "crates/yallm-storage" }
+yallm-config = { version = "0.1.0", path = "crates/yallm-config" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

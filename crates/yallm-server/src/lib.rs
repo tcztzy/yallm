@@ -11,6 +11,7 @@ use std::{net::SocketAddr, path::PathBuf};
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
 
+mod dashboard;
 mod logging;
 mod proxy;
 mod responses_routes;
@@ -18,6 +19,7 @@ mod routes;
 mod state;
 mod tls;
 
+pub use dashboard::*;
 pub use logging::*;
 pub use proxy::*;
 pub use responses_routes::*;
@@ -61,6 +63,16 @@ pub fn app_with_state(state: AppState) -> Router {
     Router::new()
         .route("/", get(routes::root))
         .route("/health", get(routes::health))
+        .route("/dashboard", get(dashboard::dashboard_page))
+        .route(
+            "/dashboard/api/events",
+            get(dashboard::dashboard_events).delete(dashboard::dashboard_clear),
+        )
+        .route("/dashboard/assets/main.js", get(dashboard::dashboard_js))
+        .route(
+            "/dashboard/assets/styles.css",
+            get(dashboard::dashboard_css),
+        )
         .route("/v1/models", get(routes::models_list))
         .route("/v1/chat/completions", post(routes::chat_completions))
         .route("/v1/messages", post(routes::anthropic_messages))

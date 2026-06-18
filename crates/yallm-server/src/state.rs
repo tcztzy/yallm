@@ -2,16 +2,28 @@ use std::{
     collections::HashMap,
     env,
     future::Future,
-    path::PathBuf,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+
+pub(crate) const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
+pub(crate) const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+pub(crate) const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
+const DEFAULT_FORWARD_HEADERS: &[&str] = &[
+    "authorization",
+    "x-api-key",
+    "api-key",
+    "openai-organization",
+    "openai-project",
+    "anthropic-version",
+    "anthropic-beta",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
@@ -47,13 +59,18 @@ pub struct LoggingConfig {
 pub struct ProviderConfig {
     pub openai_api_key: Option<String>,
     pub openai_base_url: String,
+    pub openai_headers: Vec<(String, String)>,
 
     pub anthropic_api_key: Option<String>,
     pub anthropic_auth_token: Option<String>,
     pub anthropic_base_url: String,
     pub anthropic_version: String,
+    pub anthropic_headers: Vec<(String, String)>,
 
     pub ollama_base_url: String,
+    pub ollama_headers: Vec<(String, String)>,
+
+    pub forward_headers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +80,8 @@ pub struct ModelRoute {
     pub api_base: Option<String>,
     pub api_key: Option<String>,
     pub api_version: Option<String>,
+    pub headers: Vec<(String, String)>,
+    pub forward_headers: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -74,6 +93,7 @@ pub struct AppState {
     pub default_provider: Provider,
     pub logging: LoggingConfig,
     pub request_id: Arc<AtomicU64>,
+    pub monitor_upstream_urls: Arc<Mutex<HashMap<u64, String>>>,
     pub openai_models: Vec<String>,
     pub anthropic_models: Vec<String>,
     pub model_routes: HashMap<String, ModelRoute>,
@@ -82,6 +102,19 @@ pub struct AppState {
 impl AppState {
     pub fn next_request_id(&self) -> u64 {
         self.request_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn record_monitor_upstream_url(&self, request_id: u64, url: &str) {
+        if let Ok(mut urls) = self.monitor_upstream_urls.lock() {
+            urls.insert(request_id, url.to_string());
+        }
+    }
+
+    pub fn take_monitor_upstream_url(&self, request_id: u64) -> Option<String> {
+        self.monitor_upstream_urls
+            .lock()
+            .ok()
+            .and_then(|mut urls| urls.remove(&request_id))
     }
 
     pub fn from_loaded_config(config: yallm_config::LoadedConfig) -> Self {
@@ -107,18 +140,23 @@ impl AppState {
 
         let provider = ProviderConfig {
             openai_api_key: env_opt(&env_map, "OPENAI_API_KEY"),
-            openai_base_url: env_string(&env_map, "OPENAI_BASE_URL", "https://api.openai.com"),
+            openai_base_url: env_string(&env_map, "OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
+            openai_headers: env_headers(&env_map, "YALLM_OPENAI_HEADERS"),
 
             anthropic_api_key: env_opt(&env_map, "ANTHROPIC_API_KEY"),
             anthropic_auth_token: env_opt(&env_map, "ANTHROPIC_AUTH_TOKEN"),
             anthropic_base_url: env_string(
                 &env_map,
                 "ANTHROPIC_BASE_URL",
-                "https://api.anthropic.com",
+                DEFAULT_ANTHROPIC_BASE_URL,
             ),
             anthropic_version: env_string(&env_map, "ANTHROPIC_VERSION", "2023-06-01"),
+            anthropic_headers: env_headers(&env_map, "YALLM_ANTHROPIC_HEADERS"),
 
-            ollama_base_url: env_string(&env_map, "OLLAMA_BASE_URL", "http://localhost:11434"),
+            ollama_base_url: env_string(&env_map, "OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL),
+            ollama_headers: env_headers(&env_map, "YALLM_OLLAMA_HEADERS"),
+
+            forward_headers: env_header_names(&env_map, "YALLM_FORWARD_HEADERS"),
         };
 
         let logging = LoggingConfig {
@@ -126,9 +164,21 @@ impl AppState {
             body_max_bytes: env_usize(&env_map, "YALLM_LOG_BODY_MAX_BYTES", 0),
         };
 
-        let storage_path = env_opt(&env_map, yallm_storage::STORAGE_PATH_ENV).map(PathBuf::from);
-        let store = yallm_storage::LocalStore::open_sync(storage_path)
-            .expect("failed to open local yallm storage");
+        let store = if let Some(db_url) = env_opt(&env_map, yallm_storage::DB_URL_ENV) {
+            yallm_storage::LocalStore::open_database_url_sync(Some(&db_url))
+                .expect("failed to open yallm database")
+        } else if let Some(storage_path) = env_opt(&env_map, yallm_storage::STORAGE_PATH_ENV) {
+            tracing::warn!(
+                "{} is deprecated; use {}=sqlite:///path/to/yallm.sqlite3",
+                yallm_storage::STORAGE_PATH_ENV,
+                yallm_storage::DB_URL_ENV
+            );
+            yallm_storage::LocalStore::open_sync(Some(storage_path.into()))
+                .expect("failed to open legacy local yallm storage")
+        } else {
+            yallm_storage::LocalStore::open_database_url_sync(None)
+                .expect("failed to open default yallm database")
+        };
 
         // Avoid consulting OS proxy configuration (which can require platform APIs that
         // aren't always available in sandboxed/test environments).
@@ -186,6 +236,7 @@ impl AppState {
             default_provider,
             logging,
             request_id: Arc::new(AtomicU64::new(1)),
+            monitor_upstream_urls: Arc::new(Mutex::new(HashMap::new())),
             openai_models,
             anthropic_models,
             model_routes,
@@ -218,6 +269,136 @@ fn env_string(env_map: &HashMap<String, String>, name: &str, default: &str) -> S
         .filter(|s| !s.is_empty())
         .cloned()
         .unwrap_or_else(|| default.to_string())
+}
+
+fn env_headers(env_map: &HashMap<String, String>, env_name: &str) -> Vec<(String, String)> {
+    let Some(raw) = env_opt(env_map, env_name) else {
+        return Vec::new();
+    };
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+
+    let parsed = match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!("{env_name} must be a JSON object of header names to values: {err}");
+            return Vec::new();
+        }
+    };
+    let serde_json::Value::Object(obj) = parsed else {
+        tracing::warn!("{env_name} must be a JSON object of header names to values");
+        return Vec::new();
+    };
+
+    let mut entries = obj.into_iter().collect::<Vec<_>>();
+    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    entries
+        .into_iter()
+        .filter_map(|(header_name, value)| {
+            let header_name = header_name.trim();
+            if header_name.is_empty() {
+                return None;
+            }
+            json_scalar_to_string(value)
+                .and_then(|value| resolve_env_header_value(&value, env_map, env_name, header_name))
+                .map(|value| (header_name.to_string(), value))
+        })
+        .collect()
+}
+
+fn json_scalar_to_string(value: serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(v) => Some(v.to_string()),
+        serde_json::Value::Number(v) => Some(v.to_string()),
+        serde_json::Value::String(v) => Some(v),
+        _ => None,
+    }
+}
+
+fn resolve_env_header_value(
+    value: &str,
+    env_map: &HashMap<String, String>,
+    env_name: &str,
+    header_name: &str,
+) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        return None;
+    }
+
+    if let Some(name) = value.strip_prefix("os.environ/") {
+        return env_header_lookup(name, env_map, env_name, header_name);
+    }
+
+    interpolate_env_header_refs(value, env_map, env_name, header_name)
+}
+
+fn interpolate_env_header_refs(
+    value: &str,
+    env_map: &HashMap<String, String>,
+    env_name: &str,
+    header_name: &str,
+) -> Option<String> {
+    let mut rest = value;
+    let mut out = String::new();
+
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find('}') else {
+            out.push_str(&rest[start..]);
+            return Some(out);
+        };
+        let name = after_start[..end].trim();
+        let value = env_header_lookup(name, env_map, env_name, header_name)?;
+        out.push_str(&value);
+        rest = &after_start[end + 1..];
+    }
+
+    out.push_str(rest);
+    Some(out)
+}
+
+fn env_header_lookup(
+    name: &str,
+    env_map: &HashMap<String, String>,
+    env_name: &str,
+    header_name: &str,
+) -> Option<String> {
+    let name = name.trim();
+    match env_map.get(name).map(String::as_str).map(str::trim) {
+        Some(value) if !value.is_empty() => Some(value.to_string()),
+        _ => {
+            tracing::warn!("{env_name} header '{header_name}' references missing env var {name}");
+            None
+        }
+    }
+}
+
+fn env_header_names(env_map: &HashMap<String, String>, name: &str) -> Vec<String> {
+    match env_map.get(name).map(String::as_str).map(str::trim) {
+        Some(raw) if raw.is_empty() || raw.eq_ignore_ascii_case("none") => Vec::new(),
+        Some(raw) => parse_header_names(raw),
+        None => DEFAULT_FORWARD_HEADERS
+            .iter()
+            .map(|h| h.to_string())
+            .collect(),
+    }
+}
+
+fn parse_header_names(raw: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for header in raw.split(',') {
+        let header = header.trim().to_ascii_lowercase();
+        if !header.is_empty() && seen.insert(header.clone()) {
+            out.push(header);
+        }
+    }
+    out
 }
 
 /// Parse comma-separated model list from env var. Returns `default` when empty/absent.
@@ -276,6 +457,8 @@ fn model_routes_from_litellm(
             api_base: model.api_base,
             api_key: model.api_key,
             api_version: model.api_version,
+            headers: model.headers,
+            forward_headers: model.forward_headers,
         };
         if routes.insert(alias.clone(), route).is_none() {
             aliases.push(alias);

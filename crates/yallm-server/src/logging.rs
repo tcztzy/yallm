@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::{Body, Bytes, to_bytes},
@@ -9,7 +9,7 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::state::AppState;
+use crate::{proxy::choose_provider, state::AppState};
 
 #[derive(Debug, Clone, Copy)]
 pub struct RequestId(pub u64);
@@ -113,6 +113,8 @@ pub async fn log_http(State(state): State<AppState>, req: Request, next: Next) -
     let started = Instant::now();
 
     let (mut parts, body) = req.into_parts();
+    let method = parts.method.clone();
+    let uri = parts.uri.clone();
     let body_bytes = to_bytes(body, usize::MAX)
         .await
         .unwrap_or_else(|_| Bytes::new());
@@ -134,7 +136,7 @@ pub async fn log_http(State(state): State<AppState>, req: Request, next: Next) -
     );
 
     parts.extensions.insert(RequestId(request_id));
-    let req2 = Request::from_parts(parts, Body::from(body_bytes));
+    let req2 = Request::from_parts(parts, Body::from(body_bytes.clone()));
 
     let resp = next.run(req2).await;
     let (parts, body) = resp.into_parts();
@@ -144,6 +146,7 @@ pub async fn log_http(State(state): State<AppState>, req: Request, next: Next) -
 
     let out_body = body_to_log(&out_body_bytes, state.logging.body_max_bytes);
     let out_headers = headers_to_json(&parts.headers, state.logging.redact_secrets);
+    let latency_ms = started.elapsed().as_millis();
 
     tracing::info!(
         event = "http.out",
@@ -155,8 +158,43 @@ pub async fn log_http(State(state): State<AppState>, req: Request, next: Next) -
         body_is_utf8 = out_body.is_utf8,
         body_text = %out_body.text.clone().unwrap_or_default(),
         body_b64 = %out_body.b64.clone().unwrap_or_default(),
-        latency_ms = started.elapsed().as_millis(),
+        latency_ms,
     );
+
+    let path = uri.path();
+    if should_record_monitor_event(path) {
+        let request_json = serde_json::from_slice::<serde_json::Value>(&body_bytes).ok();
+        let (provider, upstream_model) =
+            monitor_target(&state, request_json.as_ref().and_then(request_model));
+        let event = yallm_storage::MonitorEvent {
+            request_id,
+            timestamp_ms: unix_millis(),
+            method: method.as_str().to_string(),
+            uri: uri.to_string(),
+            endpoint: endpoint_label(method.as_str(), path),
+            status: parts.status.as_u16(),
+            latency_ms: u64::try_from(latency_ms).unwrap_or(u64::MAX),
+            request_bytes: u64::try_from(body_bytes.len()).unwrap_or(u64::MAX),
+            response_bytes: u64::try_from(out_body_bytes.len()).unwrap_or(u64::MAX),
+            provider,
+            model: request_json
+                .as_ref()
+                .and_then(request_model)
+                .map(str::to_string),
+            upstream_model,
+            upstream_url: state
+                .take_monitor_upstream_url(request_id)
+                .map(|url| sanitize_upstream_url(&url)),
+            stream: request_json
+                .as_ref()
+                .and_then(|v| v.get("stream"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        };
+        if let Err(err) = state.store.record_monitor_event(event).await {
+            tracing::warn!(event = "monitor.record.error", request_id, error = %err);
+        }
+    }
 
     // Rebuild response with buffered body.
     let mut resp2 = Response::from_parts(parts, Body::from(out_body_bytes));
@@ -166,6 +204,95 @@ pub async fn log_http(State(state): State<AppState>, req: Request, next: Next) -
         request_id.to_string().parse().unwrap(),
     );
     resp2
+}
+
+fn request_model(value: &serde_json::Value) -> Option<&str> {
+    value.get("model").and_then(serde_json::Value::as_str)
+}
+
+fn monitor_target(state: &AppState, model: Option<&str>) -> (Option<String>, Option<String>) {
+    let Some(model) = model else {
+        return (None, None);
+    };
+    let target = choose_provider(state, model);
+    (
+        Some(target.provider.as_str().to_string()),
+        Some(target.upstream_model),
+    )
+}
+
+fn sanitize_upstream_url(url: &str) -> String {
+    let cut_at = url.find(['?', '#']).unwrap_or(url.len());
+    let without_query = &url[..cut_at];
+
+    let Some((scheme, rest)) = without_query.split_once("://") else {
+        return without_query.to_string();
+    };
+    let Some(at) = rest.find('@') else {
+        return without_query.to_string();
+    };
+    if rest.find('/').is_some_and(|slash| slash < at) {
+        return without_query.to_string();
+    }
+
+    format!("{scheme}://[redacted]@{}", &rest[at + 1..])
+}
+
+fn should_record_monitor_event(path: &str) -> bool {
+    !path.starts_with("/dashboard")
+}
+
+fn endpoint_label(method: &str, path: &str) -> String {
+    match path {
+        "/" => "/".to_string(),
+        "/health" => "/health".to_string(),
+        "/v1/models" => "/v1/models".to_string(),
+        "/v1/chat/completions" => "/v1/chat/completions".to_string(),
+        "/v1/messages" => "/v1/messages".to_string(),
+        "/api/chat" => "/api/chat".to_string(),
+        "/v1/responses" => "/v1/responses".to_string(),
+        "/v1/responses/input_tokens" => "/v1/responses/input_tokens".to_string(),
+        "/v1/responses/compact" => "/v1/responses/compact".to_string(),
+        "/v1/conversations" => "/v1/conversations".to_string(),
+        _ if path.starts_with("/v1/responses/") => response_endpoint_label(method, path),
+        _ if path.starts_with("/v1/conversations/") => conversation_endpoint_label(path),
+        _ => path.to_string(),
+    }
+}
+
+fn response_endpoint_label(method: &str, path: &str) -> String {
+    let suffix = path.strip_prefix("/v1/responses/").unwrap_or_default();
+    if suffix.ends_with("/cancel") {
+        "/v1/responses/{response_id}/cancel".to_string()
+    } else if suffix.ends_with("/input_items") {
+        "/v1/responses/{response_id}/input_items".to_string()
+    } else if method == "DELETE" || !suffix.contains('/') {
+        "/v1/responses/{response_id}".to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+fn conversation_endpoint_label(path: &str) -> String {
+    let suffix = path.strip_prefix("/v1/conversations/").unwrap_or_default();
+    if suffix.ends_with("/items") {
+        "/v1/conversations/{conversation_id}/items".to_string()
+    } else if suffix.contains("/items/") {
+        "/v1/conversations/{conversation_id}/items/{item_id}".to_string()
+    } else if !suffix.contains('/') {
+        "/v1/conversations/{conversation_id}".to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 pub fn redact_json_secrets(value: &serde_json::Value) -> serde_json::Value {
@@ -197,4 +324,21 @@ pub fn redact_json_secrets(value: &serde_json::Value) -> serde_json::Value {
     }
 
     go(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_upstream_url;
+
+    #[test]
+    fn upstream_url_sanitization_removes_credentials_query_and_fragment() {
+        assert_eq!(
+            sanitize_upstream_url("https://user:secret@example.test/v1/chat?token=secret#frag"),
+            "https://[redacted]@example.test/v1/chat"
+        );
+        assert_eq!(
+            sanitize_upstream_url("ocdb://cluster.example/path?api_key=secret"),
+            "ocdb://cluster.example/path"
+        );
+    }
 }

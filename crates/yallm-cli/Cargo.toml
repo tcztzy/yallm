@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+publish.workspace = true
 description = "CLI for yallm - unified LLM API converter"
 
 [dependencies]

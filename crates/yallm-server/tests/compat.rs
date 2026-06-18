@@ -1,3 +1,9 @@
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -6,7 +12,32 @@ use axum::{
 use tower::ServiceExt;
 
 fn app() -> Router {
-    yallm_server::app()
+    yallm_server::app_with_state(state_with_temp_store("compat"))
+}
+
+fn state_with_temp_store(name: &str) -> yallm_server::AppState {
+    let mut env = HashMap::new();
+    env.insert(yallm_storage::DB_URL_ENV.to_string(), temp_db_url(name));
+    yallm_server::AppState::from_loaded_config(yallm_config::LoadedConfig {
+        env,
+        litellm_models: Vec::new(),
+        warnings: Vec::new(),
+    })
+}
+
+fn temp_store_path(name: &str) -> PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!("yallm-compat-test-{name}-{ts}.json"))
+}
+
+fn temp_db_url(name: &str) -> String {
+    format!(
+        "sqlite://{}",
+        temp_store_path(name).with_extension("sqlite3").display()
+    )
 }
 
 #[tokio::test]

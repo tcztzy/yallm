@@ -39,6 +39,8 @@ pub struct LiteLlmModel {
     pub api_base: Option<String>,
     pub api_key: Option<String>,
     pub api_version: Option<String>,
+    pub headers: Vec<(String, String)>,
+    pub forward_headers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,6 +337,8 @@ fn resolve_from_yallm_params(
         .api_version
         .as_deref()
         .and_then(|v| resolve_config_value(v, env_map, model_name, "api_version", false, warnings));
+    let headers = resolve_headers(params.headers, env_map, model_name, warnings);
+    let forward_headers = normalize_header_names(params.forward_headers);
 
     Some(LiteLlmModel {
         model_name: model_name.to_string(),
@@ -343,6 +347,8 @@ fn resolve_from_yallm_params(
         api_base,
         api_key,
         api_version,
+        headers,
+        forward_headers,
     })
 }
 
@@ -381,6 +387,8 @@ fn resolve_from_litellm_params(
         .api_version
         .as_deref()
         .and_then(|v| resolve_config_value(v, env_map, model_name, "api_version", false, warnings));
+    let headers = resolve_headers(params.headers, env_map, model_name, warnings);
+    let forward_headers = normalize_header_names(params.forward_headers);
 
     Some(LiteLlmModel {
         model_name: model_name.to_string(),
@@ -389,6 +397,8 @@ fn resolve_from_litellm_params(
         api_base,
         api_key,
         api_version,
+        headers,
+        forward_headers,
     })
 }
 
@@ -482,6 +492,126 @@ fn env_lookup(
     }
 }
 
+fn resolve_headers(
+    raw: HashMap<String, serde_yaml_ng::Value>,
+    env_map: &HashMap<String, String>,
+    model_name: &str,
+    warnings: &mut Vec<String>,
+) -> Vec<(String, String)> {
+    let mut entries = raw.into_iter().collect::<Vec<_>>();
+    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let mut out = Vec::new();
+    for (name, value) in entries {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            warnings.push(format!(
+                "yallm-config: skipped LiteLLM model '{model_name}' header with empty name"
+            ));
+            continue;
+        }
+
+        let Some(value) = yaml_value_to_string(value) else {
+            warnings.push(format!(
+                "yallm-config: skipped LiteLLM model '{model_name}' header '{name}' with non-scalar value"
+            ));
+            continue;
+        };
+
+        let field = format!("headers.{name}");
+        let Some(value) =
+            resolve_header_value(&name, &value, env_map, model_name, &field, warnings)
+        else {
+            continue;
+        };
+        out.push((name, value));
+    }
+    out
+}
+
+fn resolve_header_value(
+    header_name: &str,
+    value: &str,
+    env_map: &HashMap<String, String>,
+    model_name: &str,
+    field: &str,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        return None;
+    }
+
+    if let Some(name) = value.strip_prefix("os.environ/") {
+        return env_lookup(name, env_map, model_name, field, warnings);
+    }
+
+    if let Some(name) = value.strip_prefix("${").and_then(|v| v.strip_suffix('}')) {
+        return env_lookup(name, env_map, model_name, field, warnings);
+    }
+
+    let resolved = interpolate_env_refs(value, env_map, model_name, field, warnings)?;
+    if is_secret_header(header_name) && resolved == value {
+        warnings.push(format!(
+            "yallm-config: LiteLLM model '{model_name}' uses a literal secret header '{header_name}'; prefer ${{VAR}}"
+        ));
+    }
+    Some(resolved)
+}
+
+fn interpolate_env_refs(
+    value: &str,
+    env_map: &HashMap<String, String>,
+    model_name: &str,
+    field: &str,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    let mut rest = value;
+    let mut out = String::new();
+
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find('}') else {
+            out.push_str(&rest[start..]);
+            return Some(out);
+        };
+        let name = after_start[..end].trim();
+        match env_map.get(name).map(String::as_str).map(str::trim) {
+            Some(value) if !value.is_empty() => out.push_str(value),
+            _ => {
+                warnings.push(format!(
+                    "yallm-config: LiteLLM model '{model_name}' references missing env var {name} for {field}"
+                ));
+                return None;
+            }
+        }
+        rest = &after_start[end + 1..];
+    }
+
+    out.push_str(rest);
+    Some(out)
+}
+
+fn normalize_header_names(headers: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for header in headers {
+        let name = header.trim().to_ascii_lowercase();
+        if !name.is_empty() && seen.insert(name.clone()) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+fn is_secret_header(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "authorization" | "proxy-authorization" | "x-api-key" | "api-key"
+    )
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct LiteLlmConfigFile {
     #[serde(default)]
@@ -516,6 +646,10 @@ struct YallmParams {
     api_key: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_string")]
     api_version: Option<String>,
+    #[serde(default)]
+    headers: HashMap<String, serde_yaml_ng::Value>,
+    #[serde(default, deserialize_with = "deserialize_string_list")]
+    forward_headers: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -530,6 +664,10 @@ struct LiteLlmParams {
     api_version: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_string")]
     custom_llm_provider: Option<String>,
+    #[serde(default)]
+    headers: HashMap<String, serde_yaml_ng::Value>,
+    #[serde(default, deserialize_with = "deserialize_string_list")]
+    forward_headers: Vec<String>,
 }
 
 fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -538,6 +676,38 @@ where
 {
     let value = Option::<serde_yaml_ng::Value>::deserialize(deserializer)?;
     Ok(value.and_then(yaml_value_to_string))
+}
+
+fn deserialize_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_yaml_ng::Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+
+    let values = match value {
+        serde_yaml_ng::Value::Null => Vec::new(),
+        serde_yaml_ng::Value::Sequence(seq) => seq
+            .into_iter()
+            .filter_map(yaml_value_to_string)
+            .flat_map(|s| split_header_names(&s))
+            .collect(),
+        value => yaml_value_to_string(value)
+            .map(|s| split_header_names(&s))
+            .unwrap_or_default(),
+    };
+    Ok(values)
+}
+
+fn split_header_names(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn yaml_value_to_string(value: serde_yaml_ng::Value) -> Option<String> {
@@ -776,6 +946,47 @@ model_list:
 
         assert_eq!(models.len(), 0);
         assert!(warnings.iter().any(|w| w.contains("'bedrock'")));
+    }
+
+    #[test]
+    fn yallm_params_parses_headers_and_forward_header_allowlist() {
+        let mut env = HashMap::new();
+        env.insert("ROUTE_TOKEN".to_string(), "route-token".to_string());
+        let mut warnings = Vec::new();
+        let models = parse_litellm_config_str(
+            r#"
+model_list:
+  - model_name: headered
+    yallm_params:
+      provider: openai
+      model: gpt-4o
+      headers:
+        Authorization: Bearer ${ROUTE_TOKEN}
+        x-tenant: tenant-a
+      forward_headers: authorization, x-request-id, Authorization
+"#,
+            &env,
+            &mut warnings,
+        );
+
+        assert_eq!(models.len(), 1);
+        assert!(
+            models[0]
+                .headers
+                .iter()
+                .any(|(k, v)| { k == "Authorization" && v == "Bearer route-token" })
+        );
+        assert!(
+            models[0]
+                .headers
+                .iter()
+                .any(|(k, v)| k == "x-tenant" && v == "tenant-a")
+        );
+        assert_eq!(
+            models[0].forward_headers,
+            vec!["authorization", "x-request-id"]
+        );
+        assert!(warnings.is_empty());
     }
 
     #[test]

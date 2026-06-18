@@ -232,21 +232,35 @@ fn temp_store_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("yallm-responses-test-{name}-{ts}.json"))
 }
 
+fn temp_db_url(name: &str) -> String {
+    format!(
+        "sqlite://{}",
+        temp_store_path(name).with_extension("sqlite3").display()
+    )
+}
+
 fn app(name: &str, capture: Arc<Capture>) -> Router {
     let mut state = yallm_server::AppState {
         transport: Arc::new(MockTransport { capture }),
         mode: yallm_server::Mode::Proxy,
-        ..Default::default()
+        ..state_with_temp_store(name)
     };
     state.provider.openai_api_key = Some("test_openai".to_string());
     state.provider.anthropic_api_key = Some("test_anthropic".to_string());
     state.provider.openai_base_url = "http://openai.test".to_string();
     state.provider.anthropic_base_url = "http://anthropic.test".to_string();
     state.provider.ollama_base_url = "http://ollama.test".to_string();
-    state.store = Arc::new(
-        yallm_storage::LocalStore::open_sync(Some(temp_store_path(name))).expect("open store"),
-    );
     yallm_server::app_with_state(state)
+}
+
+fn state_with_temp_store(name: &str) -> yallm_server::AppState {
+    let mut env = std::collections::HashMap::new();
+    env.insert(yallm_storage::DB_URL_ENV.to_string(), temp_db_url(name));
+    yallm_server::AppState::from_loaded_config(yallm_config::LoadedConfig {
+        env,
+        litellm_models: Vec::new(),
+        warnings: Vec::new(),
+    })
 }
 
 async fn post_json(app: &Router, uri: &str, payload: Value) -> (StatusCode, Value) {

@@ -2,15 +2,18 @@ use std::{
     collections::BTreeMap,
     fmt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
 
 pub const STORAGE_PATH_ENV: &str = "YALLM_STORAGE_PATH";
+pub const DB_URL_ENV: &str = "YALLM_DB_URL";
+const MAX_MONITOR_EVENTS: usize = 2_000;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -59,6 +62,57 @@ pub struct ListPage<T> {
     pub first_id: Option<String>,
     pub last_id: Option<String>,
     pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MonitorEvent {
+    pub request_id: u64,
+    pub timestamp_ms: u64,
+    pub method: String,
+    pub uri: String,
+    pub endpoint: String,
+    pub status: u16,
+    pub latency_ms: u64,
+    pub request_bytes: u64,
+    pub response_bytes: u64,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub upstream_model: Option<String>,
+    pub upstream_url: Option<String>,
+    pub stream: bool,
+}
+
+#[derive(Clone)]
+struct SqliteStore {
+    url: String,
+    inner: Arc<Mutex<Connection>>,
+}
+
+impl fmt::Debug for SqliteStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SqliteStore")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SqliteStore {
+    fn open_sync(url: Option<&str>) -> StoreResult<Self> {
+        let url = url
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(default_db_url);
+        let conn = open_db_connection(&url)?;
+        init_db_schema(&conn)?;
+        Ok(Self {
+            url,
+            inner: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -138,25 +192,51 @@ impl Default for StoreFile {
 
 #[derive(Clone)]
 pub struct LocalStore {
+    backend: StoreBackend,
+}
+
+#[derive(Clone)]
+enum StoreBackend {
+    Json(JsonStore),
+    Sqlite(SqliteStore),
+}
+
+#[derive(Clone)]
+struct JsonStore {
     path: PathBuf,
     inner: Arc<RwLock<StoreFile>>,
 }
 
 impl fmt::Debug for LocalStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LocalStore")
-            .field("path", &self.path)
-            .finish_non_exhaustive()
+        match &self.backend {
+            StoreBackend::Json(store) => f
+                .debug_struct("LocalStore")
+                .field("path", &store.path)
+                .finish_non_exhaustive(),
+            StoreBackend::Sqlite(store) => f
+                .debug_struct("LocalStore")
+                .field("url", &store.url())
+                .finish_non_exhaustive(),
+        }
     }
 }
 
 impl LocalStore {
+    pub fn open_database_url_sync(url: Option<&str>) -> StoreResult<Self> {
+        Ok(Self {
+            backend: StoreBackend::Sqlite(SqliteStore::open_sync(url)?),
+        })
+    }
+
     pub fn open_sync(path: Option<PathBuf>) -> StoreResult<Self> {
         let path = path.unwrap_or_else(default_storage_path);
         let data = load_store_file_sync(&path)?;
         Ok(Self {
-            path,
-            inner: Arc::new(RwLock::new(data)),
+            backend: StoreBackend::Json(JsonStore {
+                path,
+                inner: Arc::new(RwLock::new(data)),
+            }),
         })
     }
 
@@ -164,13 +244,18 @@ impl LocalStore {
         let path = path.unwrap_or_else(default_storage_path);
         let data = load_store_file(&path).await?;
         Ok(Self {
-            path,
-            inner: Arc::new(RwLock::new(data)),
+            backend: StoreBackend::Json(JsonStore {
+                path,
+                inner: Arc::new(RwLock::new(data)),
+            }),
         })
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    pub fn location(&self) -> &str {
+        match &self.backend {
+            StoreBackend::Json(store) => store.path.to_str().unwrap_or("<non-utf8-path>"),
+            StoreBackend::Sqlite(store) => store.url(),
+        }
     }
 
     pub async fn create_conversation(
@@ -203,7 +288,7 @@ impl LocalStore {
     }
 
     pub async fn get_conversation(&self, conversation_id: &str) -> StoreResult<Option<Value>> {
-        let store = self.inner.read().await;
+        let store = self.read_snapshot().await?;
         let Some(conv) = store.conversations.get(conversation_id) else {
             return Ok(None);
         };
@@ -271,7 +356,7 @@ impl LocalStore {
         order: ListOrder,
         after: Option<&str>,
     ) -> StoreResult<Option<ListPage<Value>>> {
-        let store = self.inner.read().await;
+        let store = self.read_snapshot().await?;
         let Some(conv) = store.conversations.get(conversation_id) else {
             return Ok(None);
         };
@@ -296,7 +381,7 @@ impl LocalStore {
         conversation_id: &str,
         item_id: &str,
     ) -> StoreResult<Option<Value>> {
-        let store = self.inner.read().await;
+        let store = self.read_snapshot().await?;
         let Some(conv) = store.conversations.get(conversation_id) else {
             return Ok(None);
         };
@@ -350,7 +435,7 @@ impl LocalStore {
             ));
         }
 
-        let store = self.inner.read().await;
+        let store = self.read_snapshot().await?;
 
         if let Some(prev_id) = previous_response_id {
             let Some(resp) = store.responses.get(prev_id) else {
@@ -528,7 +613,7 @@ impl LocalStore {
     }
 
     pub async fn get_response(&self, response_id: &str) -> StoreResult<Option<Value>> {
-        let store = self.inner.read().await;
+        let store = self.read_snapshot().await?;
         let Some(resp) = store.responses.get(response_id) else {
             return Ok(None);
         };
@@ -542,7 +627,7 @@ impl LocalStore {
         &self,
         response_id: &str,
     ) -> StoreResult<Option<Vec<String>>> {
-        let store = self.inner.read().await;
+        let store = self.read_snapshot().await?;
         let Some(resp) = store.responses.get(response_id) else {
             return Ok(None);
         };
@@ -590,7 +675,7 @@ impl LocalStore {
         order: ListOrder,
         after: Option<&str>,
     ) -> StoreResult<Option<ListPage<Value>>> {
-        let store = self.inner.read().await;
+        let store = self.read_snapshot().await?;
         let Some(resp) = store.responses.get(response_id) else {
             return Ok(None);
         };
@@ -607,17 +692,86 @@ impl LocalStore {
         Ok(Some(page))
     }
 
+    pub async fn record_monitor_event(&self, event: MonitorEvent) -> StoreResult<()> {
+        match &self.backend {
+            StoreBackend::Json(_) => Ok(()),
+            StoreBackend::Sqlite(store) => {
+                let inner = store.inner.clone();
+                spawn_db_task(move || {
+                    let conn = lock_db_connection(&inner)?;
+                    insert_monitor_event(&conn, event)?;
+                    trim_monitor_events(&conn)?;
+                    Ok(())
+                })
+                .await
+            }
+        }
+    }
+
+    pub async fn list_monitor_events(&self, limit: usize) -> StoreResult<Vec<MonitorEvent>> {
+        match &self.backend {
+            StoreBackend::Json(_) => Ok(Vec::new()),
+            StoreBackend::Sqlite(store) => {
+                let inner = store.inner.clone();
+                spawn_db_task(move || {
+                    let conn = lock_db_connection(&inner)?;
+                    list_monitor_events(&conn, limit)
+                })
+                .await
+            }
+        }
+    }
+
+    pub async fn clear_monitor_events(&self) -> StoreResult<usize> {
+        match &self.backend {
+            StoreBackend::Json(_) => Ok(0),
+            StoreBackend::Sqlite(store) => {
+                let inner = store.inner.clone();
+                spawn_db_task(move || {
+                    let conn = lock_db_connection(&inner)?;
+                    clear_monitor_events(&conn)
+                })
+                .await
+            }
+        }
+    }
+
+    async fn read_snapshot(&self) -> StoreResult<StoreFile> {
+        match &self.backend {
+            StoreBackend::Json(store) => Ok(store.inner.read().await.clone()),
+            StoreBackend::Sqlite(store) => {
+                let conn = lock_db_connection(&store.inner)?;
+                load_store_file_from_db(&conn)
+            }
+        }
+    }
+
     async fn apply_mutation<R, F>(&self, f: F) -> StoreResult<R>
     where
         F: FnOnce(&mut StoreFile) -> StoreResult<R>,
     {
-        let (result, snapshot) = {
-            let mut store = self.inner.write().await;
-            let result = f(&mut store)?;
-            (result, store.clone())
-        };
-        persist_store_file(&self.path, &snapshot).await?;
-        Ok(result)
+        match &self.backend {
+            StoreBackend::Json(store) => {
+                let (result, snapshot) = {
+                    let mut store_file = store.inner.write().await;
+                    let result = f(&mut store_file)?;
+                    (result, store_file.clone())
+                };
+                persist_store_file(&store.path, &snapshot).await?;
+                Ok(result)
+            }
+            StoreBackend::Sqlite(store) => {
+                let mut conn = lock_db_connection(&store.inner)?;
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(sqlite_error)?;
+                let mut store_file = load_store_file_from_db(&tx)?;
+                let result = f(&mut store_file)?;
+                persist_store_file_to_db(&tx, &store_file)?;
+                tx.commit().map_err(sqlite_error)?;
+                Ok(result)
+            }
+        }
     }
 }
 
@@ -803,6 +957,577 @@ fn next_id(store: &mut StoreFile, prefix: &str) -> String {
     format!("{prefix}_{:x}{:x}", unix_seconds(), store.next_seq)
 }
 
+fn open_db_connection(url: &str) -> StoreResult<Connection> {
+    let conn = match sqlite_path_from_url(url)? {
+        None => Connection::open_in_memory().map_err(sqlite_error)?,
+        Some(path) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            Connection::open(path).map_err(sqlite_error)?
+        }
+    };
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(sqlite_error)?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(sqlite_error)?;
+    conn.pragma_update(None, "synchronous", "NORMAL")
+        .map_err(sqlite_error)?;
+    Ok(conn)
+}
+
+fn sqlite_path_from_url(url: &str) -> StoreResult<Option<PathBuf>> {
+    let url = url.trim();
+    if url == "sqlite::memory:" || url == "sqlite://:memory:" || url == ":memory:" {
+        return Ok(None);
+    }
+
+    if let Some(raw) = url.strip_prefix("sqlite://") {
+        let path = raw.split_once('?').map(|(path, _)| path).unwrap_or(raw);
+        if path.is_empty() {
+            return Err(StoreError::Invalid(
+                "sqlite database URL must include a database path".to_string(),
+            ));
+        }
+        if let Some(abs) = path.strip_prefix('/') {
+            return Ok(Some(PathBuf::from(format!("/{abs}"))));
+        }
+        return Ok(Some(PathBuf::from(path)));
+    }
+
+    if let Some(path) = url.strip_prefix("file://") {
+        let path = if path.starts_with('/') {
+            PathBuf::from(path)
+        } else {
+            PathBuf::from(format!("/{path}"))
+        };
+        return Ok(Some(path));
+    }
+
+    if url.contains("://") {
+        let scheme = url
+            .split_once("://")
+            .map(|(scheme, _)| scheme)
+            .unwrap_or(url);
+        return Err(StoreError::Invalid(format!(
+            "unsupported DB URL scheme '{scheme}'; currently supported: sqlite://, sqlite::memory:, file://"
+        )));
+    }
+
+    Ok(Some(PathBuf::from(url)))
+}
+
+fn init_db_schema(conn: &Connection) -> StoreResult<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS store_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO store_meta (key, value) VALUES ('version', '1');
+        INSERT OR IGNORE INTO store_meta (key, value) VALUES ('next_seq', '0');
+
+        CREATE TABLE IF NOT EXISTS conversations (
+            id TEXT PRIMARY KEY,
+            created_at INTEGER NOT NULL,
+            metadata TEXT NOT NULL,
+            deleted INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS items (
+            id TEXT PRIMARY KEY,
+            conversation_id TEXT,
+            item TEXT NOT NULL,
+            deleted INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_items_conversation_id ON items(conversation_id);
+
+        CREATE TABLE IF NOT EXISTS conversation_item_order (
+            conversation_id TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            item_id TEXT NOT NULL,
+            PRIMARY KEY (conversation_id, position)
+        );
+        CREATE INDEX IF NOT EXISTS idx_conversation_item_order_item_id
+            ON conversation_item_order(item_id);
+
+        CREATE TABLE IF NOT EXISTS responses (
+            id TEXT PRIMARY KEY,
+            response TEXT NOT NULL,
+            conversation_id TEXT,
+            previous_response_id TEXT,
+            provider TEXT NOT NULL,
+            input_item_ids TEXT NOT NULL,
+            output_item_ids TEXT NOT NULL,
+            context_item_ids TEXT NOT NULL,
+            stream_events TEXT NOT NULL,
+            deleted INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_responses_conversation_id ON responses(conversation_id);
+        CREATE INDEX IF NOT EXISTS idx_responses_previous_response_id ON responses(previous_response_id);
+
+        CREATE TABLE IF NOT EXISTS monitor_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id INTEGER NOT NULL,
+            timestamp_ms INTEGER NOT NULL,
+            method TEXT NOT NULL,
+            uri TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            status INTEGER NOT NULL,
+            latency_ms INTEGER NOT NULL,
+            request_bytes INTEGER NOT NULL,
+            response_bytes INTEGER NOT NULL,
+            provider TEXT,
+            model TEXT,
+            upstream_model TEXT,
+            upstream_url TEXT,
+            stream INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_monitor_events_id ON monitor_events(id);
+        CREATE INDEX IF NOT EXISTS idx_monitor_events_timestamp_ms ON monitor_events(timestamp_ms);
+        "#,
+    )
+    .map_err(sqlite_error)?;
+    ensure_sqlite_column(conn, "monitor_events", "upstream_url", "upstream_url TEXT")?;
+    Ok(())
+}
+
+fn ensure_sqlite_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    column_def: &str,
+) -> StoreResult<()> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(sqlite_error)?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sqlite_error)?;
+    for existing in columns {
+        if existing.map_err(sqlite_error)? == column {
+            return Ok(());
+        }
+    }
+    conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column_def}"), [])
+        .map(|_| ())
+        .map_err(sqlite_error)
+}
+
+fn load_store_file_from_db(conn: &Connection) -> StoreResult<StoreFile> {
+    Ok(StoreFile {
+        version: db_meta_u32(conn, "version", 1)?,
+        next_seq: db_meta_u64(conn, "next_seq", 0)?,
+        conversations: load_conversations(conn)?,
+        items: load_items(conn)?,
+        conversation_item_order: load_conversation_item_order(conn)?,
+        responses: load_responses(conn)?,
+    })
+}
+
+fn persist_store_file_to_db(tx: &Transaction<'_>, store: &StoreFile) -> StoreResult<()> {
+    tx.execute(
+        "INSERT INTO store_meta (key, value) VALUES ('version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![store.version.to_string()],
+    )
+    .map_err(sqlite_error)?;
+    tx.execute(
+        "INSERT INTO store_meta (key, value) VALUES ('next_seq', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![store.next_seq.to_string()],
+    )
+    .map_err(sqlite_error)?;
+
+    tx.execute("DELETE FROM conversation_item_order", [])
+        .map_err(sqlite_error)?;
+    tx.execute("DELETE FROM responses", [])
+        .map_err(sqlite_error)?;
+    tx.execute("DELETE FROM items", []).map_err(sqlite_error)?;
+    tx.execute("DELETE FROM conversations", [])
+        .map_err(sqlite_error)?;
+
+    for conv in store.conversations.values() {
+        tx.execute(
+            "INSERT INTO conversations (id, created_at, metadata, deleted)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                &conv.id,
+                i64::try_from(conv.created_at).unwrap_or(i64::MAX),
+                serde_json::to_string(&conv.metadata)?,
+                bool_to_i64(conv.deleted),
+            ],
+        )
+        .map_err(sqlite_error)?;
+    }
+
+    for item in store.items.values() {
+        tx.execute(
+            "INSERT INTO items (id, conversation_id, item, deleted)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                &item.id,
+                item.conversation_id.as_deref(),
+                serde_json::to_string(&item.item)?,
+                bool_to_i64(item.deleted),
+            ],
+        )
+        .map_err(sqlite_error)?;
+    }
+
+    for (conversation_id, item_ids) in &store.conversation_item_order {
+        for (position, item_id) in item_ids.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO conversation_item_order (conversation_id, position, item_id)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    conversation_id,
+                    i64::try_from(position).unwrap_or(i64::MAX),
+                    item_id,
+                ],
+            )
+            .map_err(sqlite_error)?;
+        }
+    }
+
+    for resp in store.responses.values() {
+        tx.execute(
+            "INSERT INTO responses (
+                id, response, conversation_id, previous_response_id, provider,
+                input_item_ids, output_item_ids, context_item_ids, stream_events, deleted
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                &resp.id,
+                serde_json::to_string(&resp.response)?,
+                resp.conversation_id.as_deref(),
+                resp.previous_response_id.as_deref(),
+                &resp.provider,
+                serde_json::to_string(&resp.input_item_ids)?,
+                serde_json::to_string(&resp.output_item_ids)?,
+                serde_json::to_string(&resp.context_item_ids)?,
+                serde_json::to_string(&resp.stream_events)?,
+                bool_to_i64(resp.deleted),
+            ],
+        )
+        .map_err(sqlite_error)?;
+    }
+
+    Ok(())
+}
+
+fn db_meta_u32(conn: &Connection, key: &str, default: u32) -> StoreResult<u32> {
+    let raw = db_meta_string(conn, key)?;
+    Ok(raw
+        .as_deref()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(default))
+}
+
+fn db_meta_u64(conn: &Connection, key: &str, default: u64) -> StoreResult<u64> {
+    let raw = db_meta_string(conn, key)?;
+    Ok(raw
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default))
+}
+
+fn db_meta_string(conn: &Connection, key: &str) -> StoreResult<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM store_meta WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(sqlite_error)
+}
+
+fn load_conversations(conn: &Connection) -> StoreResult<BTreeMap<String, ConversationRecord>> {
+    let mut stmt = conn
+        .prepare("SELECT id, created_at, metadata, deleted FROM conversations ORDER BY id")
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let metadata: String = row.get(2)?;
+            Ok((
+                id.clone(),
+                id,
+                row.get::<_, i64>(1)?,
+                metadata,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(sqlite_error)?;
+
+    let mut out = BTreeMap::new();
+    for row in rows {
+        let (key, id, created_at, metadata, deleted) = row.map_err(sqlite_error)?;
+        out.insert(
+            key,
+            ConversationRecord {
+                id,
+                created_at: i64_to_u64(created_at),
+                metadata: serde_json::from_str(&metadata)?,
+                deleted: deleted != 0,
+            },
+        );
+    }
+    Ok(out)
+}
+
+fn load_items(conn: &Connection) -> StoreResult<BTreeMap<String, ItemRecord>> {
+    let mut stmt = conn
+        .prepare("SELECT id, conversation_id, item, deleted FROM items ORDER BY id")
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let item: String = row.get(2)?;
+            Ok((
+                id.clone(),
+                id,
+                row.get::<_, Option<String>>(1)?,
+                item,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(sqlite_error)?;
+
+    let mut out = BTreeMap::new();
+    for row in rows {
+        let (key, id, conversation_id, item, deleted) = row.map_err(sqlite_error)?;
+        out.insert(
+            key,
+            ItemRecord {
+                id,
+                conversation_id,
+                item: serde_json::from_str(&item)?,
+                deleted: deleted != 0,
+            },
+        );
+    }
+    Ok(out)
+}
+
+fn load_conversation_item_order(conn: &Connection) -> StoreResult<BTreeMap<String, Vec<String>>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT conversation_id, item_id
+             FROM conversation_item_order
+             ORDER BY conversation_id, position",
+        )
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(sqlite_error)?;
+
+    let mut out = BTreeMap::<String, Vec<String>>::new();
+    for row in rows {
+        let (conversation_id, item_id) = row.map_err(sqlite_error)?;
+        out.entry(conversation_id).or_default().push(item_id);
+    }
+    Ok(out)
+}
+
+fn load_responses(conn: &Connection) -> StoreResult<BTreeMap<String, ResponseRecord>> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT id, response, conversation_id, previous_response_id, provider,
+                   input_item_ids, output_item_ids, context_item_ids, stream_events, deleted
+            FROM responses
+            ORDER BY id
+            "#,
+        )
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            Ok((
+                id.clone(),
+                id,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, i64>(9)?,
+            ))
+        })
+        .map_err(sqlite_error)?;
+
+    let mut out = BTreeMap::new();
+    for row in rows {
+        let (
+            key,
+            id,
+            response,
+            conversation_id,
+            previous_response_id,
+            provider,
+            input_item_ids,
+            output_item_ids,
+            context_item_ids,
+            stream_events,
+            deleted,
+        ) = row.map_err(sqlite_error)?;
+        out.insert(
+            key,
+            ResponseRecord {
+                id,
+                response: serde_json::from_str(&response)?,
+                conversation_id,
+                previous_response_id,
+                provider,
+                input_item_ids: serde_json::from_str(&input_item_ids)?,
+                output_item_ids: serde_json::from_str(&output_item_ids)?,
+                context_item_ids: serde_json::from_str(&context_item_ids)?,
+                stream_events: serde_json::from_str(&stream_events)?,
+                deleted: deleted != 0,
+            },
+        );
+    }
+    Ok(out)
+}
+
+fn insert_monitor_event(conn: &Connection, event: MonitorEvent) -> StoreResult<()> {
+    conn.execute(
+        r#"
+        INSERT INTO monitor_events (
+            request_id, timestamp_ms, method, uri, endpoint, status,
+            latency_ms, request_bytes, response_bytes, provider, model,
+            upstream_model, upstream_url, stream
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        "#,
+        params![
+            i64::try_from(event.request_id).unwrap_or(i64::MAX),
+            i64::try_from(event.timestamp_ms).unwrap_or(i64::MAX),
+            event.method,
+            event.uri,
+            event.endpoint,
+            i64::from(event.status),
+            i64::try_from(event.latency_ms).unwrap_or(i64::MAX),
+            i64::try_from(event.request_bytes).unwrap_or(i64::MAX),
+            i64::try_from(event.response_bytes).unwrap_or(i64::MAX),
+            event.provider,
+            event.model,
+            event.upstream_model,
+            event.upstream_url,
+            bool_to_i64(event.stream),
+        ],
+    )
+    .map(|_| ())
+    .map_err(sqlite_error)
+}
+
+fn list_monitor_events(conn: &Connection, limit: usize) -> StoreResult<Vec<MonitorEvent>> {
+    let limit = limit.clamp(1, MAX_MONITOR_EVENTS);
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT request_id, timestamp_ms, method, uri, endpoint, status,
+                   latency_ms, request_bytes, response_bytes, provider, model,
+                   upstream_model, upstream_url, stream
+            FROM monitor_events
+            ORDER BY id DESC
+            LIMIT ?1
+            "#,
+        )
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+            Ok(MonitorEvent {
+                request_id: i64_to_u64(row.get(0)?),
+                timestamp_ms: i64_to_u64(row.get(1)?),
+                method: row.get(2)?,
+                uri: row.get(3)?,
+                endpoint: row.get(4)?,
+                status: i64_to_u16(row.get(5)?),
+                latency_ms: i64_to_u64(row.get(6)?),
+                request_bytes: i64_to_u64(row.get(7)?),
+                response_bytes: i64_to_u64(row.get(8)?),
+                provider: row.get(9)?,
+                model: row.get(10)?,
+                upstream_model: row.get(11)?,
+                upstream_url: row.get(12)?,
+                stream: row.get::<_, i64>(13)? != 0,
+            })
+        })
+        .map_err(sqlite_error)?;
+
+    let mut events = Vec::new();
+    for row in rows {
+        events.push(row.map_err(sqlite_error)?);
+    }
+    Ok(events)
+}
+
+fn clear_monitor_events(conn: &Connection) -> StoreResult<usize> {
+    let count = conn
+        .query_row("SELECT COUNT(*) FROM monitor_events", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .optional()
+        .map_err(sqlite_error)?
+        .unwrap_or(0);
+    conn.execute("DELETE FROM monitor_events", [])
+        .map_err(sqlite_error)?;
+    Ok(usize::try_from(count).unwrap_or(usize::MAX))
+}
+
+fn trim_monitor_events(conn: &Connection) -> StoreResult<()> {
+    conn.execute(
+        r#"
+        DELETE FROM monitor_events
+        WHERE id NOT IN (
+            SELECT id FROM monitor_events ORDER BY id DESC LIMIT ?1
+        )
+        "#,
+        params![i64::try_from(MAX_MONITOR_EVENTS).unwrap_or(i64::MAX)],
+    )
+    .map(|_| ())
+    .map_err(sqlite_error)
+}
+
+fn lock_db_connection(
+    inner: &Arc<Mutex<Connection>>,
+) -> StoreResult<std::sync::MutexGuard<'_, Connection>> {
+    inner
+        .lock()
+        .map_err(|_| StoreError::Invalid("database connection lock poisoned".to_string()))
+}
+
+async fn spawn_db_task<T, F>(f: F) -> StoreResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> StoreResult<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|err| StoreError::Invalid(format!("database task failed: {err}")))?
+}
+
+fn bool_to_i64(value: bool) -> i64 {
+    if value { 1 } else { 0 }
+}
+
+fn sqlite_error(err: rusqlite::Error) -> StoreError {
+    StoreError::Io(std::io::Error::other(err))
+}
+
+fn i64_to_u64(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
+}
+
+fn i64_to_u16(value: i64) -> u16 {
+    u16::try_from(value).unwrap_or(0)
+}
+
 fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -856,6 +1581,15 @@ pub fn default_storage_path() -> PathBuf {
     }
 
     std::env::temp_dir().join("yallm").join("storage.json")
+}
+
+pub fn default_db_url() -> String {
+    let path = if let Some(cache_dir) = dirs::cache_dir() {
+        cache_dir.join("yallm").join("storage.sqlite3")
+    } else {
+        std::env::temp_dir().join("yallm").join("storage.sqlite3")
+    };
+    format!("sqlite://{}", path.display())
 }
 
 #[cfg(test)]
@@ -933,5 +1667,103 @@ mod tests {
             .expect("resolve context");
         assert!(context.items.len() >= 2);
         assert_eq!(context.conversation_id, saved.conversation_id);
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_persists_responses_and_previous_context() {
+        let db_url = format!(
+            "sqlite://{}",
+            temp_path("sqlite-response-chain")
+                .with_extension("sqlite3")
+                .display()
+        );
+        let store = LocalStore::open_database_url_sync(Some(&db_url)).expect("sqlite store open");
+        let saved = store
+            .save_response(SaveResponseRequest {
+                response: json!({
+                    "object":"response",
+                    "status":"completed",
+                    "model":"gpt-4o-mini",
+                    "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}]
+                }),
+                request_input_items: vec![json!({
+                    "type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]
+                })],
+                conversation_id: None,
+                previous_response_id: None,
+                provider: "openai".to_string(),
+                stream_events: vec!["data: [DONE]\n\n".to_string()],
+            })
+            .await
+            .expect("save response");
+
+        let reopened =
+            LocalStore::open_database_url_sync(Some(&db_url)).expect("reopen sqlite store");
+        let response_id = saved.response["id"].as_str().unwrap().to_string();
+        let context = reopened
+            .resolve_context(None, Some(&response_id))
+            .await
+            .expect("resolve context");
+        assert!(context.items.len() >= 2);
+        assert_eq!(context.conversation_id, saved.conversation_id);
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_records_lists_and_clears_monitor_events() {
+        let db_path = temp_path("monitor").with_extension("sqlite3");
+        let db_url = format!("sqlite://{}", db_path.display());
+        let store = LocalStore::open_database_url_sync(Some(&db_url)).expect("sqlite store open");
+
+        store
+            .record_monitor_event(MonitorEvent {
+                request_id: 7,
+                timestamp_ms: 123,
+                method: "POST".to_string(),
+                uri: "/v1/chat/completions".to_string(),
+                endpoint: "/v1/chat/completions".to_string(),
+                status: 200,
+                latency_ms: 42,
+                request_bytes: 11,
+                response_bytes: 22,
+                provider: Some("openai".to_string()),
+                model: Some("openai:gpt-test".to_string()),
+                upstream_model: Some("gpt-test".to_string()),
+                upstream_url: Some("https://api.openai.com/v1/chat/completions".to_string()),
+                stream: true,
+            })
+            .await
+            .expect("record event");
+
+        let events = store.list_monitor_events(10).await.expect("list events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].request_id, 7);
+        assert_eq!(events[0].provider.as_deref(), Some("openai"));
+        assert_eq!(
+            events[0].upstream_url.as_deref(),
+            Some("https://api.openai.com/v1/chat/completions")
+        );
+        assert!(events[0].stream);
+
+        let deleted = store.clear_monitor_events().await.expect("clear events");
+        assert_eq!(deleted, 1);
+        assert!(
+            store
+                .list_monitor_events(10)
+                .await
+                .expect("list events")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn db_url_parses_sqlite_file_and_rejects_unknown_scheme() {
+        assert_eq!(
+            sqlite_path_from_url("sqlite:///tmp/yallm.sqlite3")
+                .expect("sqlite path")
+                .unwrap(),
+            PathBuf::from("/tmp/yallm.sqlite3")
+        );
+        assert!(sqlite_path_from_url("sqlite::memory:").unwrap().is_none());
+        assert!(sqlite_path_from_url("odbc://dsn/yallm").is_err());
     }
 }
