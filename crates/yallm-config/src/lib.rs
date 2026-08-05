@@ -48,6 +48,7 @@ pub enum LiteLlmProvider {
     OpenAI,
     Anthropic,
     Ollama,
+    Acp,
 }
 
 /// Top-level yallm TOML structure.
@@ -407,6 +408,7 @@ fn parse_yallm_provider(s: &str) -> Option<LiteLlmProvider> {
         "openai" => Some(LiteLlmProvider::OpenAI),
         "anthropic" => Some(LiteLlmProvider::Anthropic),
         "ollama" => Some(LiteLlmProvider::Ollama),
+        "acp" => Some(LiteLlmProvider::Acp),
         _ => None,
     }
 }
@@ -433,6 +435,7 @@ fn infer_provider_and_model(
             strip_model_prefix(model, "anthropic"),
         )),
         "ollama" => Some((LiteLlmProvider::Ollama, strip_model_prefix(model, "ollama"))),
+        "acp" => Some((LiteLlmProvider::Acp, strip_model_prefix(model, "acp"))),
         _ => None,
     }
 }
@@ -780,12 +783,15 @@ model_list:
   - model_name: llama-alias
     litellm_params:
       model: ollama/llama3
+  - model_name: agent-alias
+    litellm_params:
+      model: acp/codex
 "#,
             &env,
             &mut warnings,
         );
 
-        assert_eq!(models.len(), 3);
+        assert_eq!(models.len(), 4);
         assert_eq!(models[0].model_name, "gpt-alias");
         assert_eq!(models[0].provider, LiteLlmProvider::OpenAI);
         assert_eq!(models[0].upstream_model, "gpt-4o");
@@ -793,6 +799,8 @@ model_list:
         assert_eq!(models[1].provider, LiteLlmProvider::Anthropic);
         assert_eq!(models[1].api_key, None);
         assert_eq!(models[2].provider, LiteLlmProvider::Ollama);
+        assert_eq!(models[3].provider, LiteLlmProvider::Acp);
+        assert_eq!(models[3].upstream_model, "codex");
         assert!(warnings.is_empty());
     }
 
@@ -946,6 +954,27 @@ model_list:
 
         assert_eq!(models.len(), 0);
         assert!(warnings.iter().any(|w| w.contains("'bedrock'")));
+    }
+
+    #[test]
+    fn yallm_params_accepts_acp_provider() {
+        let mut warnings = Vec::new();
+        let models = parse_litellm_config_str(
+            r#"
+model_list:
+  - model_name: codex-agent
+    yallm_params:
+      provider: acp
+      model: codex
+"#,
+            &HashMap::new(),
+            &mut warnings,
+        );
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].provider, LiteLlmProvider::Acp);
+        assert_eq!(models[0].upstream_model, "codex");
+        assert!(warnings.is_empty());
     }
 
     #[test]

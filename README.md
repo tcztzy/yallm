@@ -17,7 +17,7 @@ What exists today:
   OpenAPI specs.
 - An axum server crate (`crates/yallm-server`) and a CLI crate (`crates/yallm-cli`).
 - Compatibility endpoints exist and are validated with official Python SDKs.
-- Real upstream provider proxying exists (OpenAI / Anthropic / Ollama), with an **auto** mode that
+- Real upstream provider proxying exists (OpenAI / Anthropic / Ollama / ACP), with an **auto** mode that
   falls back to deterministic mock responses when provider configuration is missing.
 - `stream=true` is supported on all compat endpoints, including true upstream streaming in proxy
   mode (with cross-provider stream translation).
@@ -37,6 +37,7 @@ What exists today:
 - `crates/yallm`: top-level binary (starts the HTTP server)
 - `crates/yallm-cli`: CLI argument parsing
 - `crates/yallm-server`: axum HTTP server (compat endpoints; real proxying + mock fallback)
+- `crates/yallm-acp`: ACP upstream/downstream bridge helpers
 - `crates/yallm-ir`: intermediate representation (IR) used for conversions
 - `crates/yallm-openai`: OpenAI types + conversions (generated from OpenAPI + hand-written mapping)
 - `crates/yallm-responses`: OpenAI Responses/Conversations types + IR mapping helpers
@@ -92,6 +93,7 @@ prefix:
 - `openai:<model>` or `openai/<model>`
 - `anthropic:<model>` or `anthropic/<model>`
 - `ollama:<model>` or `ollama/<model>`
+- `acp:<model>` or `acp/<model>`
 
 If no prefix is present, `YALLM_DEFAULT_PROVIDER` is used (default: `openai`).
 
@@ -142,6 +144,15 @@ Ollama:
 - `OLLAMA_BASE_URL` (default `http://localhost:11434`)
 - `YALLM_OLLAMA_HEADERS` (optional JSON object of additional upstream headers)
 
+ACP:
+- `YALLM_ACP_COMMAND` command used to launch the ACP agent subprocess, for example
+  `npx -y @agentclientprotocol/codex-acp`
+- `YALLM_ACP_CWD` optional working directory sent in `session/new`; defaults to the current
+  process directory
+
+For HTTP `stream=true` requests routed to ACP, yallm streams downstream chunks from ACP
+`session/update` agent message notifications.
+
 `YALLM_*_HEADERS` values may use `os.environ/VAR` or `${VAR}` references, including interpolation
 such as `"Authorization": "Bearer ${UPSTREAM_TOKEN}"`.
 
@@ -166,7 +177,7 @@ Local storage:
 Point yallm at a LiteLLM `config.yaml` with `--litellm-config <path>` or
 `YALLM_LITELLM_CONFIG=<path>`. The CLI flag wins when both are set.
 
-Each model alias is reachable via **every** supported protocol — yallm converts
+Each model alias is reachable via **every** supported HTTP protocol — yallm converts
 between OpenAI / Anthropic / Ollama formats on the fly. An alias whose upstream
 is `openai/gpt-4o` can be called from `/v1/chat/completions`, `/v1/messages`,
 or `/api/chat`. `GET /v1/models` therefore lists the same alias set under every
@@ -183,7 +194,7 @@ appear on the same entry, **`yallm_params` wins**.
 model_list:
   - model_name: gpt-alias
     yallm_params:                    # preferred
-      provider: openai               # one of: openai | anthropic | ollama
+      provider: openai               # one of: openai | anthropic | ollama | acp
       model: gpt-4o
       api_base: https://openai-compatible.example/v1
       api_key: os.environ/OPENAI_API_KEY
@@ -203,7 +214,7 @@ model_list:
 
 Supported `litellm_params` v1 fields: `model_name` and
 `litellm_params.model/api_base/api_key/api_version/custom_llm_provider/headers/forward_headers` for
-OpenAI-compatible, Anthropic, and Ollama upstreams. Exact aliases take priority
+OpenAI-compatible, Anthropic, Ollama, and ACP upstreams. Exact aliases take priority
 over prefix/default-provider routing. Advanced LiteLLM router features,
 fallback rules, budgets, wildcard model groups, and Azure OpenAI routing are
 not implemented.
@@ -211,6 +222,19 @@ not implemented.
 Use env references for keys instead of committing secrets — both
 `os.environ/VAR` and `${VAR}` syntaxes are accepted. Header values additionally support interpolation,
 for example `Authorization: Bearer ${UPSTREAM_TOKEN}`.
+
+### ACP Downstream Mode
+
+Run yallm itself as an ACP agent over stdio:
+
+```bash
+yallm acp --model anthropic:claude-sonnet-4-5
+```
+
+ACP clients send `initialize`, `session/new`, and `session/prompt` to this process. yallm converts
+the ACP prompt into its IR, routes it through the configured upstream provider or mock mode, and
+streams the answer back with `session/update`. In ACP mode, logs are written to stderr so stdout
+remains valid ACP JSON-RPC.
 
 ### Logging (Fluentd-Friendly JSON)
 

@@ -13,6 +13,7 @@ publish = ["crates-io"]
 [workspace.dependencies]
 # Internal crates
 yallm-ir = { version = "0.1.0", path = "crates/yallm-ir" }
+yallm-acp = { version = "0.1.0", path = "crates/yallm-acp" }
 yallm-cli = { version = "0.1.0", path = "crates/yallm-cli" }
 yallm-server = { version = "0.1.0", path = "crates/yallm-server" }
 yallm-openai = { version = "0.1.0", path = "crates/yallm-openai" }

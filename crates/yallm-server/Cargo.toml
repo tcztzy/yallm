@@ -16,6 +16,7 @@ yallm-ollama.workspace = true
 yallm-responses.workspace = true
 yallm-storage.workspace = true
 yallm-config.workspace = true
+yallm-acp.workspace = true
 
 axum.workspace = true
 tokio.workspace = true

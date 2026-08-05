@@ -81,6 +81,7 @@ enum ProviderStreamParser {
     OpenAI(SseDecoder),
     Anthropic(SseDecoder),
     Ollama(LineDecoder),
+    Acp(LineDecoder),
 }
 
 impl ProviderStreamParser {
@@ -89,6 +90,7 @@ impl ProviderStreamParser {
             Provider::OpenAI => Self::OpenAI(SseDecoder::default()),
             Provider::Anthropic => Self::Anthropic(SseDecoder::default()),
             Provider::Ollama => Self::Ollama(LineDecoder::default()),
+            Provider::Acp => Self::Acp(LineDecoder::default()),
         }
     }
 
@@ -109,6 +111,11 @@ impl ProviderStreamParser {
                 .into_iter()
                 .flat_map(|line| parse_ollama_line(&line))
                 .collect(),
+            ProviderStreamParser::Acp(lines) => lines
+                .push(bytes)
+                .into_iter()
+                .flat_map(|line| parse_acp_line(&line))
+                .collect(),
         }
     }
 
@@ -128,6 +135,11 @@ impl ProviderStreamParser {
                 .finish()
                 .into_iter()
                 .flat_map(|line| parse_ollama_line(&line))
+                .collect(),
+            ProviderStreamParser::Acp(lines) => lines
+                .finish()
+                .into_iter()
+                .flat_map(|line| parse_acp_line(&line))
                 .collect(),
         }
     }
@@ -516,6 +528,33 @@ fn parse_ollama_line(line: &str) -> Vec<ProviderStreamEvent> {
     }
 
     out
+}
+
+fn parse_acp_line(line: &str) -> Vec<ProviderStreamEvent> {
+    if line.trim().is_empty() {
+        return Vec::new();
+    }
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        return Vec::new();
+    };
+
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some("text_delta") => v
+            .get("text")
+            .and_then(|t| t.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|text| vec![ProviderStreamEvent::TextDelta(text.to_string())])
+            .unwrap_or_default(),
+        Some("stop") => vec![ProviderStreamEvent::Stop {
+            finish_reason: v
+                .get("finish_reason")
+                .and_then(|r| r.as_str())
+                .map(str::to_string),
+            prompt_tokens: None,
+            completion_tokens: None,
+        }],
+        _ => Vec::new(),
+    }
 }
 
 #[derive(Default, Clone)]
@@ -1242,5 +1281,37 @@ fn map_to_anthropic_stop_reason(reason: Option<&str>) -> String {
         Some("stop") | Some("end_turn") => "end_turn".to_string(),
         Some(other) => other.to_string(),
         None => "end_turn".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use futures::StreamExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn maps_acp_text_events_to_openai_stream() {
+        let upstream = Box::pin(futures::stream::iter(vec![Ok(Bytes::from_static(
+            br#"{"type":"text_delta","text":"hello"}
+{"type":"stop","finish_reason":"stop"}
+"#,
+        ))]));
+
+        let mut downstream = map_provider_stream_to_downstream(
+            Provider::Acp,
+            DownstreamProtocol::OpenAI,
+            upstream,
+            "codex".to_string(),
+        );
+        let mut body = Vec::new();
+        while let Some(chunk) = downstream.next().await {
+            body.extend_from_slice(&chunk.expect("stream chunk"));
+        }
+        let body = String::from_utf8(body).expect("utf8 stream");
+
+        assert!(body.contains(r#""content":"hello""#), "{body}");
+        assert!(body.contains("data: [DONE]"), "{body}");
     }
 }

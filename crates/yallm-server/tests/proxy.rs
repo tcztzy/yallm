@@ -54,6 +54,35 @@ fn state_with_temp_store(name: &str) -> yallm_server::AppState {
     })
 }
 
+#[test]
+fn acp_provider_prefix_and_env_config_are_supported() {
+    let mut env = HashMap::new();
+    env.insert(
+        yallm_storage::DB_URL_ENV.to_string(),
+        temp_db_url("acp-config"),
+    );
+    env.insert("YALLM_DEFAULT_PROVIDER".to_string(), "acp".to_string());
+    env.insert(
+        "YALLM_ACP_COMMAND".to_string(),
+        "npx -y @agentclientprotocol/codex-acp".to_string(),
+    );
+    let state = yallm_server::AppState::from_loaded_config(yallm_config::LoadedConfig {
+        env,
+        litellm_models: Vec::new(),
+        warnings: Vec::new(),
+    });
+
+    assert_eq!(state.default_provider, yallm_server::Provider::Acp);
+    assert_eq!(
+        state.provider.acp_command.as_deref(),
+        Some("npx -y @agentclientprotocol/codex-acp")
+    );
+
+    let target = yallm_server::choose_provider(&state, "acp:codex");
+    assert_eq!(target.provider, yallm_server::Provider::Acp);
+    assert_eq!(target.upstream_model, "codex");
+}
+
 fn temp_store_path(name: &str) -> PathBuf {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)

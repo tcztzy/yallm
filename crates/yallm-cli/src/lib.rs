@@ -57,6 +57,16 @@ pub enum Commands {
         #[arg(long)]
         litellm_config: Option<PathBuf>,
     },
+    /// Run yallm as an ACP agent over stdio
+    Acp {
+        /// Upstream model/provider route to use for ACP prompts
+        #[arg(long, default_value = "openai:gpt-5.2")]
+        model: String,
+
+        /// Path to a LiteLLM config.yaml file
+        #[arg(long)]
+        litellm_config: Option<PathBuf>,
+    },
 }
 
 impl Cli {
@@ -85,6 +95,29 @@ mod tests {
                 assert_eq!(litellm_config, Some(PathBuf::from("litellm.yaml")));
             }
             _ => panic!("expected serve command"),
+        }
+    }
+
+    #[test]
+    fn parses_acp_command() {
+        let cli = Cli::parse_from([
+            "yallm",
+            "acp",
+            "--model",
+            "anthropic:claude-sonnet-4-5",
+            "--litellm-config",
+            "litellm.yaml",
+        ]);
+
+        match cli.command {
+            Some(Commands::Acp {
+                model,
+                litellm_config,
+            }) => {
+                assert_eq!(model, "anthropic:claude-sonnet-4-5");
+                assert_eq!(litellm_config, Some(PathBuf::from("litellm.yaml")));
+            }
+            _ => panic!("expected acp command"),
         }
     }
 }

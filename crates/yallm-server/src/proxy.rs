@@ -1,4 +1,4 @@
-use std::{convert::Infallible, pin::Pin, time::Instant};
+use std::{convert::Infallible, path::PathBuf, pin::Pin, time::Instant};
 
 use axum::http::HeaderMap;
 use bytes::Bytes;
@@ -10,7 +10,7 @@ use crate::{
     logging::redact_json_secrets,
     state::{
         AppState, DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_OPENAI_BASE_URL, Mode, ModelRoute, Provider,
-        TransportByteStream, TransportRequest,
+        TransportByteStream, TransportError, TransportRequest,
     },
 };
 
@@ -24,7 +24,7 @@ pub struct ProxyError {
 }
 
 fn provider_from_model(model: &str) -> (Option<Provider>, String) {
-    // Accept `openai:<m>` / `openai/<m>` (and same for anthropic/ollama).
+    // Accept `openai:<m>` / `openai/<m>` (and same for anthropic/ollama/acp).
     for (prefix, p) in [
         ("openai:", Provider::OpenAI),
         ("openai/", Provider::OpenAI),
@@ -32,6 +32,8 @@ fn provider_from_model(model: &str) -> (Option<Provider>, String) {
         ("anthropic/", Provider::Anthropic),
         ("ollama:", Provider::Ollama),
         ("ollama/", Provider::Ollama),
+        ("acp:", Provider::Acp),
+        ("acp/", Provider::Acp),
     ] {
         if let Some(rest) = model.strip_prefix(prefix) {
             return (Some(p), rest.to_string());
@@ -80,6 +82,24 @@ pub fn should_proxy(
     }
 }
 
+pub async fn complete_ir(
+    state: &AppState,
+    request_id: u64,
+    mut ir: ChatRequest,
+    incoming_headers: &HeaderMap,
+) -> Result<ChatResponse, ProxyError> {
+    let target = choose_provider(state, &ir.model);
+    ir.model = target.upstream_model.clone();
+
+    match should_proxy(state, &target, incoming_headers)? {
+        true => call_provider(state, request_id, &target, &ir, incoming_headers).await,
+        false => {
+            let reply = mock_reply(extract_last_user_text(&ir));
+            Ok(mock_ir_response(&ir.model, reply))
+        }
+    }
+}
+
 fn provider_is_configured(
     state: &AppState,
     target: &ProviderTarget,
@@ -111,6 +131,7 @@ fn provider_is_configured(
                 || state.provider.anthropic_base_url != DEFAULT_ANTHROPIC_BASE_URL
         }
         Provider::Ollama => true, // base_url is always present; Ollama typically does not need a key
+        Provider::Acp => state.provider.acp_command.is_some(),
     }
 }
 
@@ -127,6 +148,7 @@ pub async fn call_provider(
             call_anthropic(state, request_id, target, ir, incoming_headers).await
         }
         Provider::Ollama => call_ollama(state, request_id, target, ir, incoming_headers).await,
+        Provider::Acp => call_acp(state, request_id, target, ir).await,
     }
 }
 
@@ -162,6 +184,7 @@ pub async fn call_provider_stream(
         Provider::Ollama => {
             call_ollama_stream(state, request_id, target, ir, incoming_headers).await
         }
+        Provider::Acp => call_acp_stream(state, request_id, target, ir).await,
     }
 }
 
@@ -271,6 +294,7 @@ fn provider_default_headers(state: &AppState, target: &ProviderTarget) -> Vec<(S
             headers
         }
         Provider::Ollama => state.provider.ollama_headers.clone(),
+        Provider::Acp => Vec::new(),
     }
 }
 
@@ -294,7 +318,7 @@ fn route_headers(target: &ProviderTarget) -> Vec<(String, String)> {
                 headers.push(("x-api-key".to_string(), key));
             }
         }
-        Provider::Ollama => {}
+        Provider::Ollama | Provider::Acp => {}
     }
     headers.extend(route.headers.clone());
     headers
@@ -579,6 +603,164 @@ async fn call_ollama(
         message: "Failed to parse Ollama response".to_string(),
         upstream_body: None,
     })
+}
+
+async fn call_acp(
+    state: &AppState,
+    request_id: u64,
+    target: &ProviderTarget,
+    ir: &ChatRequest,
+) -> Result<ChatResponse, ProxyError> {
+    let Some(command) = state.provider.acp_command.clone() else {
+        return Err(ProxyError {
+            status: 400,
+            message: "ACP upstream is not configured; set YALLM_ACP_COMMAND".to_string(),
+            upstream_body: None,
+        });
+    };
+
+    let cwd = state
+        .provider
+        .acp_cwd
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+    let started = Instant::now();
+    state.record_monitor_upstream_url(request_id, &format!("acp://{}", target.upstream_model));
+
+    tracing::info!(
+        event = "provider.out",
+        request_id,
+        provider = "acp",
+        command = %command,
+        cwd = %cwd.display(),
+        model = %target.upstream_model,
+    );
+
+    let response = yallm_acp::complete_with_command(&command, cwd, ir.clone())
+        .await
+        .map_err(|e| ProxyError {
+            status: 502,
+            message: format!("Failed to call ACP upstream: {e}"),
+            upstream_body: None,
+        })?;
+
+    tracing::info!(
+        event = "provider.in",
+        request_id,
+        provider = "acp",
+        latency_ms = started.elapsed().as_millis(),
+    );
+
+    Ok(response)
+}
+
+async fn call_acp_stream(
+    state: &AppState,
+    request_id: u64,
+    target: &ProviderTarget,
+    ir: &ChatRequest,
+) -> Result<ProviderStream, ProxyError> {
+    let Some(command) = state.provider.acp_command.clone() else {
+        return Err(ProxyError {
+            status: 400,
+            message: "ACP upstream is not configured; set YALLM_ACP_COMMAND".to_string(),
+            upstream_body: None,
+        });
+    };
+
+    let cwd = state
+        .provider
+        .acp_cwd
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+    let started = Instant::now();
+    state.record_monitor_upstream_url(request_id, &format!("acp://{}", target.upstream_model));
+
+    tracing::info!(
+        event = "provider.out.stream",
+        request_id,
+        provider = "acp",
+        command = %command,
+        cwd = %cwd.display(),
+        model = %target.upstream_model,
+    );
+
+    let events =
+        yallm_acp::stream_with_command(&command, cwd, ir.clone()).map_err(|e| ProxyError {
+            status: 502,
+            message: format!("Failed to start ACP upstream stream: {e}"),
+            upstream_body: None,
+        })?;
+
+    tracing::info!(
+        event = "provider.in.stream",
+        request_id,
+        provider = "acp",
+        latency_ms = started.elapsed().as_millis(),
+    );
+
+    let body = events.map(|event| {
+        event
+            .map(acp_stream_event_to_line)
+            .map(Bytes::from)
+            .map_err(|message| TransportError { message })
+    });
+
+    Ok(ProviderStream {
+        provider: Provider::Acp,
+        body: Box::pin(body),
+    })
+}
+
+fn acp_stream_event_to_line(event: yallm_acp::AcpStreamEvent) -> String {
+    let payload = match event {
+        yallm_acp::AcpStreamEvent::TextDelta(text) => {
+            json!({ "type": "text_delta", "text": text })
+        }
+        yallm_acp::AcpStreamEvent::Stop { finish_reason } => {
+            json!({ "type": "stop", "finish_reason": finish_reason })
+        }
+    };
+    format!("{}\n", json_to_compact_string(&payload))
+}
+
+fn extract_last_user_text(ir: &ChatRequest) -> Option<String> {
+    ir.messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User)
+        .map(|m| {
+            m.content
+                .iter()
+                .find_map(|c| match c {
+                    Content::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        })
+        .filter(|s| !s.is_empty())
+}
+
+fn mock_reply(last_user_text: Option<String>) -> String {
+    match last_user_text {
+        Some(text) => format!("yallm (mock): {text}"),
+        None => "yallm (mock): hello".to_string(),
+    }
+}
+
+fn mock_ir_response(model: &str, reply: String) -> ChatResponse {
+    ChatResponse {
+        id: format!("mock_{}", unix_seconds()),
+        model: model.to_string(),
+        choices: vec![Choice {
+            index: 0,
+            message: Message::text(Role::Assistant, reply),
+            finish_reason: Some("stop".to_string()),
+        }],
+        usage: Some(Usage::default()),
+    }
 }
 
 async fn call_openai_stream(

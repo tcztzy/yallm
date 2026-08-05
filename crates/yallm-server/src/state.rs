@@ -30,6 +30,7 @@ pub enum Provider {
     OpenAI,
     Anthropic,
     Ollama,
+    Acp,
 }
 
 impl Provider {
@@ -38,6 +39,7 @@ impl Provider {
             Provider::OpenAI => "openai",
             Provider::Anthropic => "anthropic",
             Provider::Ollama => "ollama",
+            Provider::Acp => "acp",
         }
     }
 }
@@ -69,6 +71,9 @@ pub struct ProviderConfig {
 
     pub ollama_base_url: String,
     pub ollama_headers: Vec<(String, String)>,
+
+    pub acp_command: Option<String>,
+    pub acp_cwd: Option<String>,
 
     pub forward_headers: Vec<String>,
 }
@@ -155,6 +160,9 @@ impl AppState {
 
             ollama_base_url: env_string(&env_map, "OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL),
             ollama_headers: env_headers(&env_map, "YALLM_OLLAMA_HEADERS"),
+
+            acp_command: env_opt(&env_map, "YALLM_ACP_COMMAND"),
+            acp_cwd: env_opt(&env_map, "YALLM_ACP_CWD"),
 
             forward_headers: env_header_names(&env_map, "YALLM_FORWARD_HEADERS"),
         };
@@ -419,6 +427,7 @@ fn parse_provider(s: &str) -> Option<Provider> {
         "openai" => Some(Provider::OpenAI),
         "anthropic" => Some(Provider::Anthropic),
         "ollama" => Some(Provider::Ollama),
+        "acp" => Some(Provider::Acp),
         _ => None,
     }
 }
@@ -449,6 +458,7 @@ fn model_routes_from_litellm(
             yallm_config::LiteLlmProvider::OpenAI => Provider::OpenAI,
             yallm_config::LiteLlmProvider::Anthropic => Provider::Anthropic,
             yallm_config::LiteLlmProvider::Ollama => Provider::Ollama,
+            yallm_config::LiteLlmProvider::Acp => Provider::Acp,
         };
         let alias = model.model_name;
         let route = ModelRoute {
