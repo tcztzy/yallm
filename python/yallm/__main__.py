@@ -18,7 +18,7 @@ def _run() -> None:
 
         sys.exit(completed_process.returncode)
     else:
-        os.execvpe(yallm, [yallm, *sys.argv[1:]])
+        os.execvpe(yallm, [yallm, *sys.argv[1:]], os.environ)
 
 
 if __name__ == "__main__":
