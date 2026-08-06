@@ -20,3 +20,6 @@ regress = "0.10"
 
 [build-dependencies]
 dirs = "6"
+
+[lints]
+workspace = true

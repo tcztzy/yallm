@@ -1,3 +1,37 @@
+//! Application state: configuration, providers, and the transport abstraction.
+//!
+//! [`AppState`] is the single shared handle passed to every axum handler. It
+//! is built from the environment via `AppState::from_env_map` /
+//! [`AppState::from_loaded_config`] (LiteLLM config optional), or
+//! `AppState::default()` which reads the real process environment.
+//!
+//! Contents and their owners:
+//! - `provider` ([`ProviderConfig`]): per-provider base URLs / keys / extra
+//!   headers, parsed from `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+//!   `OLLAMA_BASE_URL`, `YALLM_ACP_COMMAND`, `YALLM_*_HEADERS`, …
+//! - `mode` ([`Mode`]) + `default_provider` ([`Provider`]): routing policy
+//!   (`YALLM_MODE`, `YALLM_DEFAULT_PROVIDER`).
+//! - `model_routes`: LiteLLM aliases (alias → [`ModelRoute`] with upstream
+//!   model / api base / key / headers). When present, aliases are served
+//!   under every protocol and the legacy `YALLM_OPENAI_MODELS` /
+//!   `YALLM_ANTHROPIC_MODELS` env lists are ignored.
+//! - `store`: the history/monitoring store (SQLite, see `yallm-storage`).
+//! - `transport`: the HTTP abstraction ([`Transport`]) — real impl is
+//!   reqwest; tests swap in a `MockTransport`. Streams flow as
+//!   [`TransportByteStream`].
+//! - `request_id` / `monitor_upstream_urls`: per-request ids and the
+//!   upstream URLs recorded for the monitoring dashboard.
+//!
+//! Gotchas:
+//! - `ProviderConfig.forward_headers` controls which client headers are
+//!   forwarded to upstreams (default: `YALLM_FORWARD_HEADERS` or a built-in
+//!   list); header values may reference other env vars via
+//!   `os.environ/NAME` and `${NAME}` interpolation.
+//! - The store is opened eagerly at state construction — tests must point
+//!   `YALLM_DB_URL` at a unique SQLite file (see
+//!   `crates/yallm/tests/acp_roundtrip.rs` for the pid+counter pattern;
+//!   nanosecond timestamps collide between concurrent tests).
+
 use std::{
     collections::HashMap,
     env,
@@ -26,14 +60,20 @@ const DEFAULT_FORWARD_HEADERS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Upstream provider backend.
 pub enum Provider {
+    /// OpenAI API
     OpenAI,
+    /// Anthropic API
     Anthropic,
+    /// Ollama API
     Ollama,
+    /// Agent Client Protocol subprocess (see `yallm-acp`)
     Acp,
 }
 
 impl Provider {
+    /// Provider name used in logs, model lists and storage (`openai`, ...).
     pub fn as_str(&self) -> &'static str {
         match self {
             Provider::OpenAI => "openai",
@@ -45,76 +85,120 @@ impl Provider {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Upstream-call policy.
 pub enum Mode {
+    /// Proxy when the provider is configured, mock otherwise
     Auto,
+    /// Always call the upstream (fails when unconfigured)
     Proxy,
+    /// Never call upstreams; always mock replies
     Mock,
 }
 
 #[derive(Debug, Clone)]
+/// Logging knobs parsed from `YALLM_LOG_REDACT_SECRETS` / `YALLM_LOG_BODY_MAX_BYTES`.
 pub struct LoggingConfig {
+    /// Redact secret-looking keys in logged request bodies
     pub redact_secrets: bool,
+    /// Cap for captured request bodies; 0 = unlimited
     pub body_max_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
+/// Per-provider connectivity settings, parsed from the environment.
 pub struct ProviderConfig {
+    /// `OPENAI_API_KEY`
     pub openai_api_key: Option<String>,
+    /// `OPENAI_BASE_URL` (default `https://api.openai.com`)
     pub openai_base_url: String,
+    /// Extra headers from `YALLM_OPENAI_HEADERS`
     pub openai_headers: Vec<(String, String)>,
 
+    /// `ANTHROPIC_API_KEY`
     pub anthropic_api_key: Option<String>,
+    /// `ANTHROPIC_AUTH_TOKEN` (alternative to the API key)
     pub anthropic_auth_token: Option<String>,
+    /// `ANTHROPIC_BASE_URL`
     pub anthropic_base_url: String,
+    /// `ANTHROPIC_VERSION` sent as `anthropic-version`
     pub anthropic_version: String,
+    /// Extra headers from `YALLM_ANTHROPIC_HEADERS`
     pub anthropic_headers: Vec<(String, String)>,
 
+    /// `OLLAMA_BASE_URL` (default `http://localhost:11434`)
     pub ollama_base_url: String,
+    /// Extra headers from `YALLM_OLLAMA_HEADERS`
     pub ollama_headers: Vec<(String, String)>,
 
+    /// `YALLM_ACP_COMMAND` — command that starts the ACP agent subprocess
     pub acp_command: Option<String>,
+    /// `YALLM_ACP_CWD` — working directory for the ACP agent (default: cwd)
     pub acp_cwd: Option<String>,
 
+    /// Client header names forwarded to upstreams (`YALLM_FORWARD_HEADERS` or default list)
     pub forward_headers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// LiteLLM alias resolution: alias name → upstream provider + overrides.
 pub struct ModelRoute {
+    /// Upstream provider
     pub provider: Provider,
+    /// Model name sent to the upstream
     pub upstream_model: String,
+    /// Base URL override (per-route)
     pub api_base: Option<String>,
+    /// API key override (per-route)
     pub api_key: Option<String>,
+    /// API version override (per-route)
     pub api_version: Option<String>,
+    /// Extra headers to send (per-route)
     pub headers: Vec<(String, String)>,
+    /// Client headers to forward (per-route)
     pub forward_headers: Vec<String>,
 }
 
 #[derive(Clone)]
+/// Shared server state: config, store, transport and request bookkeeping.
 pub struct AppState {
+    /// HTTP transport (reqwest in production, mock in tests)
     pub transport: Arc<dyn Transport>,
+    /// Persistence: responses, conversations, monitor events
     pub store: Arc<yallm_storage::LocalStore>,
+    /// Provider connectivity settings
     pub provider: ProviderConfig,
+    /// Upstream-call policy
     pub mode: Mode,
+    /// Provider used when the model string has no prefix/alias
     pub default_provider: Provider,
+    /// Logging knobs
     pub logging: LoggingConfig,
+    /// Monotonic request-id counter
     pub request_id: Arc<AtomicU64>,
+    /// request id → upstream URL, recorded by the proxy for the dashboard
     pub monitor_upstream_urls: Arc<Mutex<HashMap<u64, String>>>,
+    /// Model names served on the OpenAI interface
     pub openai_models: Vec<String>,
+    /// Model names served on the Anthropic interface
     pub anthropic_models: Vec<String>,
+    /// LiteLLM alias → route
     pub model_routes: HashMap<String, ModelRoute>,
 }
 
 impl AppState {
+    /// Allocate the next request id (monotonic, starts at 1)
     pub fn next_request_id(&self) -> u64 {
         self.request_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Remember which upstream URL served `request_id` (dashboard display).
     pub fn record_monitor_upstream_url(&self, request_id: u64, url: &str) {
         if let Ok(mut urls) = self.monitor_upstream_urls.lock() {
             urls.insert(request_id, url.to_string());
         }
     }
 
+    /// Take and clear the recorded upstream URL for `request_id`.
     pub fn take_monitor_upstream_url(&self, request_id: u64) -> Option<String> {
         self.monitor_upstream_urls
             .lock()
@@ -122,6 +206,7 @@ impl AppState {
             .and_then(|mut urls| urls.remove(&request_id))
     }
 
+    /// Build state from a `yallm-config` load result (env map + LiteLLM models).
     pub fn from_loaded_config(config: yallm_config::LoadedConfig) -> Self {
         for warning in &config.warnings {
             tracing::warn!("{warning}");
@@ -479,47 +564,70 @@ fn model_routes_from_litellm(
 }
 
 #[derive(Debug, Clone)]
+/// One upstream HTTP request, provider-agnostic.
 pub struct TransportRequest {
+    /// HTTP method
     pub method: &'static str,
+    /// Full request URL
     pub url: String,
+    /// Header name/value pairs
     pub headers: Vec<(String, String)>,
+    /// JSON body
     pub body: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
+/// Non-streaming upstream HTTP response.
 pub struct TransportResponse {
+    /// HTTP status
     pub status: u16,
+    /// Response headers
     pub headers: Vec<(String, String)>,
+    /// Response body bytes
     pub body: Vec<u8>,
 }
 
+/// Streaming upstream HTTP response body (chunks of bytes).
 pub type TransportByteStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + Send + 'static>>;
 
+/// Streaming upstream HTTP response.
 pub struct TransportStreamResponse {
+    /// HTTP status
     pub status: u16,
+    /// Response headers
     pub headers: Vec<(String, String)>,
+    /// Response body stream
     pub body: TransportByteStream,
 }
 
 #[derive(Debug, Clone)]
+/// Transport-level error (I/O, protocol, ...).
 pub struct TransportError {
+    /// Human-readable description
     pub message: String,
 }
 
+/// Result future for a non-streaming transport call.
 pub type TransportFuture<'a> =
     Pin<Box<dyn Future<Output = Result<TransportResponse, TransportError>> + Send + 'a>>;
 
+/// Result future for a streaming transport call.
 pub type TransportStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<TransportStreamResponse, TransportError>> + Send + 'a>>;
 
+/// HTTP abstraction over upstream providers; the test suite swaps the
+/// reqwest implementation for `MockTransport`.
 pub trait Transport: Send + Sync {
+    /// Perform a non-streaming request and return the full response.
     fn send<'a>(&'a self, req: TransportRequest) -> TransportFuture<'a>;
 
+    /// Perform a streaming request; errors surface as `TransportError` chunks.
     fn send_stream<'a>(&'a self, req: TransportRequest) -> TransportStreamFuture<'a>;
 }
 
 #[derive(Debug, Clone)]
+/// Default [`Transport`] backed by reqwest (no system proxy).
 pub struct ReqwestTransport {
     http: reqwest::Client,
 }

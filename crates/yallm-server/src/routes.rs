@@ -31,6 +31,7 @@ use crate::{
 /// Health check response
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
+    /// Liveness value, always `"ok"`
     pub status: &'static str,
 }
 
@@ -53,6 +54,8 @@ pub async fn root() -> impl IntoResponse {
 /// Query parameters for `GET /v1/models`
 #[derive(Debug, Deserialize)]
 pub struct ModelsQuery {
+    /// Which API surface to filter by (`openai`, `anthropic`, `ollama`);
+    /// defaults to the default provider when absent
     pub interface: Option<String>,
 }
 
@@ -101,6 +104,7 @@ pub async fn models_list(
     }
 }
 
+/// 404 handler for unknown routes.
 pub async fn fallback() -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
@@ -155,6 +159,7 @@ fn ndjson_stream_response(stream: DownstreamByteStream) -> Response {
     resp
 }
 
+/// `POST /v1/chat/completions` — OpenAI-compatible endpoint.
 pub async fn chat_completions(
     State(state): State<AppState>,
     axum::extract::Extension(RequestId(request_id)): axum::extract::Extension<RequestId>,
@@ -274,6 +279,7 @@ pub async fn chat_completions(
     }
 }
 
+/// `POST /v1/messages` — Anthropic-compatible endpoint.
 pub async fn anthropic_messages(
     State(state): State<AppState>,
     axum::extract::Extension(RequestId(request_id)): axum::extract::Extension<RequestId>,
@@ -392,6 +398,7 @@ pub async fn anthropic_messages(
     }
 }
 
+/// `POST /api/chat` — Ollama-compatible endpoint.
 pub async fn ollama_chat(
     State(state): State<AppState>,
     axum::extract::Extension(RequestId(request_id)): axum::extract::Extension<RequestId>,

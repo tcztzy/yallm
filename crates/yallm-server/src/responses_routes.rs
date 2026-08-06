@@ -1,3 +1,29 @@
+//! OpenAI Responses & Conversations API endpoints (local-first).
+//!
+//! Implements `/v1/responses` and `/v1/conversations` with local persistence:
+//! every created response is saved to the store (SQLite) and streamed to the
+//! client as SSE from the stored events — responses survive restarts and are
+//! listed/continued via conversations.
+//!
+//! `responses_create` has two upstream paths:
+//! - **OpenAI passthrough**: when the model routes to OpenAI, the request has
+//!   no conversation/previous_response context, and proxying is on, the body
+//!   is forwarded verbatim to upstream `/v1/responses` and the result stored.
+//! - **IR path** (everything else): `create_response_to_ir` (from
+//!   `yallm-responses`) converts body + resolved conversation context into
+//!   the shared IR, then `call_provider` / mock fallback runs it like any
+//!   chat completion, and `ir_to_response` rebuilds a Responses-shaped
+//!   object for storage and streaming.
+//!
+//! State dependency: handlers read `RequestId` from an axum `Extension`
+//! (injected by `crate::logging`), so this module only works behind the
+//! logging middleware. `conversation` + `previous_response_id` in one
+//! request is rejected (400).
+//!
+//! Types here are raw `serde_json::Value` — the typed models live in
+//! `yallm-responses` (`create_response_to_ir`, `ir_to_response`,
+//! `response_to_stream_events`).
+
 use axum::{
     Json,
     body::Body,
@@ -19,17 +45,24 @@ use crate::{
 };
 
 #[derive(Debug, Deserialize, Default)]
+/// Query params for list endpoints (`limit`, `order`, `after`).
 pub struct ListQuery {
+    /// Max results
     pub limit: Option<usize>,
+    /// `asc` or `desc` (default desc)
     pub order: Option<String>,
+    /// Cursor: only items after this id
     pub after: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
+/// Query params for `GET /v1/responses/{id}`.
 pub struct GetResponseQuery {
+    /// Replay the stored SSE events when true
     pub stream: Option<bool>,
 }
 
+/// `POST /v1/responses` — create (and store) a response.
 pub async fn responses_create(
     State(state): State<AppState>,
     axum::extract::Extension(RequestId(request_id)): axum::extract::Extension<RequestId>,
@@ -168,6 +201,7 @@ pub async fn responses_create(
     (StatusCode::OK, Json(saved.response)).into_response()
 }
 
+/// `GET /v1/responses/{response_id}` — fetch a stored response.
 pub async fn responses_get(
     State(state): State<AppState>,
     Path(response_id): Path<String>,
@@ -191,6 +225,7 @@ pub async fn responses_get(
     (StatusCode::OK, Json(response)).into_response()
 }
 
+/// `DELETE /v1/responses/{response_id}`.
 pub async fn responses_delete(
     State(state): State<AppState>,
     Path(response_id): Path<String>,
@@ -202,6 +237,7 @@ pub async fn responses_delete(
     }
 }
 
+/// `POST /v1/responses/{response_id}/cancel`.
 pub async fn responses_cancel(
     State(state): State<AppState>,
     Path(response_id): Path<String>,
@@ -213,6 +249,7 @@ pub async fn responses_cancel(
     }
 }
 
+/// `GET /v1/responses/{response_id}/input_items`.
 pub async fn responses_input_items(
     State(state): State<AppState>,
     Path(response_id): Path<String>,
@@ -233,6 +270,7 @@ pub async fn responses_input_items(
     }
 }
 
+/// `POST /v1/responses/input_tokens` — count input tokens.
 pub async fn responses_input_tokens(
     State(state): State<AppState>,
     axum::extract::Extension(RequestId(request_id)): axum::extract::Extension<RequestId>,
@@ -272,6 +310,7 @@ pub async fn responses_input_tokens(
         .into_response()
 }
 
+/// `POST /v1/responses/compact` — history compaction (best-effort).
 pub async fn responses_compact(
     State(state): State<AppState>,
     axum::extract::Extension(RequestId(request_id)): axum::extract::Extension<RequestId>,
@@ -311,6 +350,7 @@ pub async fn responses_compact(
         .into_response()
 }
 
+/// `POST /v1/conversations`.
 pub async fn conversations_create(
     State(state): State<AppState>,
     Json(req): Json<Value>,
@@ -332,6 +372,7 @@ pub async fn conversations_create(
     }
 }
 
+/// `GET /v1/conversations/{conversation_id}`.
 pub async fn conversations_get(
     State(state): State<AppState>,
     Path(conversation_id): Path<String>,
@@ -343,6 +384,7 @@ pub async fn conversations_get(
     }
 }
 
+/// `POST /v1/conversations/{conversation_id}` — metadata update.
 pub async fn conversations_update(
     State(state): State<AppState>,
     Path(conversation_id): Path<String>,
@@ -360,6 +402,7 @@ pub async fn conversations_update(
     }
 }
 
+/// `DELETE /v1/conversations/{conversation_id}`.
 pub async fn conversations_delete(
     State(state): State<AppState>,
     Path(conversation_id): Path<String>,
@@ -371,6 +414,7 @@ pub async fn conversations_delete(
     }
 }
 
+/// `POST /v1/conversations/{id}/items` — append an item.
 pub async fn conversation_items_create(
     State(state): State<AppState>,
     Path(conversation_id): Path<String>,
@@ -392,6 +436,7 @@ pub async fn conversation_items_create(
     }
 }
 
+/// `GET /v1/conversations/{id}/items`.
 pub async fn conversation_items_list(
     State(state): State<AppState>,
     Path(conversation_id): Path<String>,
@@ -411,6 +456,7 @@ pub async fn conversation_items_list(
     }
 }
 
+/// `GET /v1/conversations/{id}/items/{item_id}`.
 pub async fn conversation_item_get(
     State(state): State<AppState>,
     Path((conversation_id, item_id)): Path<(String, String)>,
@@ -426,6 +472,7 @@ pub async fn conversation_item_get(
     }
 }
 
+/// `DELETE /v1/conversations/{id}/items/{item_id}`.
 pub async fn conversation_item_delete(
     State(state): State<AppState>,
     Path((conversation_id, item_id)): Path<(String, String)>,

@@ -1,3 +1,31 @@
+//! Cross-provider stream translation.
+//!
+//! [`map_provider_stream_to_downstream`] is the single entry point: it takes
+//! a raw upstream byte stream (from [`super::call_provider_stream`]), parses
+//! it into provider-neutral [`ProviderStreamEvent`]s, and renders those into
+//! the downstream protocol's wire format (OpenAI SSE, Anthropic SSE, or
+//! Ollama line JSON).
+//!
+//! Pipeline: `upstream bytes` → `ProviderStreamParser` (protocol-specific:
+//! SSE decoder for OpenAI/Anthropic, newline JSON for Ollama/ACP) →
+//! `ProviderStreamEvent` (start / text / reasoning / tool deltas / stop) →
+//! `DownstreamRenderer` → framed bytes → `DownstreamByteStream`.
+//!
+//! Invariants:
+//! - Every provider parser must emit a `Stop` event at end of stream —
+//!   renderers close with `[DONE]` only after it. The `finish()` path
+//!   synthesizes a stop if the upstream ended without one.
+//! - Tool calls are rebuilt from `ToolStart` + `ToolArgsDelta` pairs keyed by
+//!   tool index; a stray `ToolArgsDelta` still creates a tool entry (with
+//!   empty id/name), it is not dropped.
+//! - Event types unsupported by the downstream protocol (e.g. reasoning on
+//!   Ollama) are silently filtered, not errored — translation is lossy by
+//!   design to keep streams alive.
+//!
+//! Gotcha: parsing and rendering run in a spawned task; upstream errors are
+//! logged and the stream is cut (`[DONE]` or EOF) rather than propagated —
+//! callers must not rely on error delivery mid-stream.
+
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
@@ -10,6 +38,8 @@ use super::{
     json_to_compact_string, sse_data_frame, sse_event_frame, unix_seconds,
 };
 
+/// Translate an upstream stream to the downstream wire protocol (see module
+/// docs for the pipeline and its invariants).
 pub fn map_provider_stream_to_downstream(
     provider: Provider,
     downstream: DownstreamProtocol,

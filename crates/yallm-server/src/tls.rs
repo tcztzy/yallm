@@ -37,6 +37,7 @@ pub struct TlsListener {
 }
 
 impl TlsListener {
+    /// Bind a TLS listener on `addr` (TLS handshakes handled per-connection).
     pub async fn bind(addr: SocketAddr, acceptor: TlsAcceptor) -> io::Result<Self> {
         let tcp = TcpListener::bind(addr).await?;
         Ok(Self { tcp, acceptor })

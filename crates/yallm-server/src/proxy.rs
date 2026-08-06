@@ -1,3 +1,34 @@
+//! Provider routing and upstream calling — the heart of yallm.
+//!
+//! Every downstream request funnels through this module. The canonical flow:
+//!
+//! 1. [`choose_provider`] resolves a model string (`gpt-5.2`, `acp:codex`,
+//!    `anthropic/...`, or a LiteLLM alias) into a [`ProviderTarget`].
+//!    Route precedence: LiteLLM alias (via `YALLM_LITELLM_CONFIG`) wins,
+//!    then a `provider:` / `provider/` prefix, then the default provider.
+//! 2. [`should_proxy`] decides between real upstream call and deterministic
+//!    mock reply, based on `YALLM_MODE` (auto / proxy / mock). Auto = proxy
+//!    when the provider is configured, mock otherwise.
+//! 3. [`complete_ir`] (non-streaming) or [`call_provider_stream`] (streaming)
+//!    dispatch to the provider: OpenAI / Anthropic / Ollama go over the
+//!    transport as HTTP; ACP spawns a subprocess (`YALLM_ACP_COMMAND`) that
+//!    speaks the Agent Client Protocol over stdio.
+//!
+//! Downstream request bodies are converted into the shared IR via
+//! `openai_downstream_to_ir` / `anthropic_downstream_to_ir`; upstream
+//! responses come back as IR or as a raw byte stream that
+//! [`map_provider_stream_to_downstream`](crate::proxy::stream::map_provider_stream_to_downstream)
+//! converts to the downstream wire format.
+//!
+//! Gotchas:
+//! - Header redaction here (`redact_headers`) must stay consistent with the
+//!   HTTP logging middleware in `crate::logging`.
+//! - ACP is the one provider with no HTTP fallback: when `YALLM_ACP_COMMAND`
+//!   is unset, `call_acp` errors with status 400 ("ACP upstream is not
+//!   configured") and `should_proxy` treats ACP as unconfigured in auto mode.
+//! - `Mode::Proxy` forces upstream calls even when nothing is configured —
+//!   expect errors for unset keys; auto mode is the safe default.
+
 use std::{convert::Infallible, path::PathBuf, pin::Pin, time::Instant};
 
 use axum::http::HeaderMap;
@@ -17,9 +48,13 @@ use crate::{
 mod stream;
 
 #[derive(Debug)]
+/// Upstream/proxy failure mapped to a client-facing HTTP response.
 pub struct ProxyError {
+    /// HTTP status to return to the client
     pub status: u16,
+    /// Error message (logged; also exposed to the client)
     pub message: String,
+    /// Upstream error body, when one was returned
     pub upstream_body: Option<Value>,
 }
 
@@ -43,13 +78,19 @@ fn provider_from_model(model: &str) -> (Option<Provider>, String) {
 }
 
 #[derive(Debug, Clone)]
+/// Resolved upstream target for a model string.
 pub struct ProviderTarget {
+    /// Upstream provider
     pub provider: Provider,
+    /// Model name as the client wrote it
     pub downstream_model: String,
+    /// Model name sent to the upstream
     pub upstream_model: String,
+    /// LiteLLM route this target came from, when any
     pub route: Option<ModelRoute>,
 }
 
+/// Resolve a model string to a [`ProviderTarget`]: LiteLLM alias first, then `provider:`/`provider/` prefix, then the default provider.
 pub fn choose_provider(state: &AppState, model: &str) -> ProviderTarget {
     if let Some(route) = state.model_routes.get(model) {
         return ProviderTarget {
@@ -70,6 +111,7 @@ pub fn choose_provider(state: &AppState, model: &str) -> ProviderTarget {
     }
 }
 
+/// Decide between real upstream call and mock reply for a target.
 pub fn should_proxy(
     state: &AppState,
     target: &ProviderTarget,
@@ -82,6 +124,7 @@ pub fn should_proxy(
     }
 }
 
+/// Run an IR [`ChatRequest`] end-to-end: choose provider, proxy or mock, and return the IR [`ChatResponse`]. Public non-streaming entry point used by routes and the ACP backend.
 pub async fn complete_ir(
     state: &AppState,
     request_id: u64,
@@ -135,6 +178,7 @@ fn provider_is_configured(
     }
 }
 
+/// Call the upstream for a resolved target (non-streaming).
 pub async fn call_provider(
     state: &AppState,
     request_id: u64,
@@ -152,21 +196,30 @@ pub async fn call_provider(
     }
 }
 
+/// A streaming upstream call: provider kind + raw upstream byte stream.
 pub struct ProviderStream {
+    /// Which provider produced the stream
     pub provider: Provider,
+    /// Raw upstream stream (provider wire format)
     pub body: TransportByteStream,
 }
 
+/// Byte stream in the downstream protocol's wire format.
 pub type DownstreamByteStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send + 'static>>;
 
 #[derive(Debug, Clone, Copy)]
+/// The downstream API surface a stream is rendered for.
 pub enum DownstreamProtocol {
+    /// OpenAI SSE (`data:` frames, `[DONE]`)
     OpenAI,
+    /// Anthropic SSE (`event:`/`data:` frames)
     Anthropic,
+    /// Ollama newline-delimited JSON
     Ollama,
 }
 
+/// Start a streaming upstream call for a resolved target.
 pub async fn call_provider_stream(
     state: &AppState,
     request_id: u64,
@@ -188,6 +241,7 @@ pub async fn call_provider_stream(
     }
 }
 
+/// API key for an OpenAI target (route override or global config).
 pub fn openai_api_key(state: &AppState, target: &ProviderTarget) -> Option<String> {
     target
         .route
@@ -196,6 +250,7 @@ pub fn openai_api_key(state: &AppState, target: &ProviderTarget) -> Option<Strin
         .or_else(|| state.provider.openai_api_key.clone())
 }
 
+/// Base URL for an OpenAI target (route override or global config).
 pub fn openai_base_url(state: &AppState, target: &ProviderTarget) -> String {
     target
         .route
@@ -204,6 +259,7 @@ pub fn openai_base_url(state: &AppState, target: &ProviderTarget) -> String {
         .unwrap_or_else(|| state.provider.openai_base_url.clone())
 }
 
+/// Build an OpenAI URL, trimming a trailing `/v1` so `path` decides.
 pub fn normalized_openai_url(state: &AppState, target: &ProviderTarget, path: &str) -> String {
     format!(
         "{}{}",
@@ -972,6 +1028,7 @@ fn with_stream_flag(mut body: Value, stream: bool) -> Value {
 // Downstream (any) -> IR
 // ============================================================================
 
+/// Parse an OpenAI `/v1/chat/completions` request body into IR.
 pub fn openai_downstream_to_ir(req: &Value) -> Option<ChatRequest> {
     let model = req.get("model")?.as_str()?.to_string();
     let stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1073,6 +1130,7 @@ pub fn openai_downstream_to_ir(req: &Value) -> Option<ChatRequest> {
     })
 }
 
+/// Parse an Anthropic `/v1/messages` request body into IR.
 pub fn anthropic_downstream_to_ir(req: &Value) -> Option<ChatRequest> {
     let model = req.get("model")?.as_str()?.to_string();
     let stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1134,6 +1192,7 @@ pub fn anthropic_downstream_to_ir(req: &Value) -> Option<ChatRequest> {
     })
 }
 
+/// Parse an Ollama `/api/chat` request body into IR.
 pub fn ollama_downstream_to_ir(req: &Value) -> Option<ChatRequest> {
     let model = req.get("model")?.as_str()?.to_string();
     let stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1630,6 +1689,7 @@ pub use stream::map_provider_stream_to_downstream;
 // IR -> downstream response JSON
 // ============================================================================
 
+/// Render an IR response as an OpenAI `/v1/chat/completions` body.
 pub fn ir_to_openai_downstream_response(ir_resp: &ChatResponse, model: &str) -> Value {
     let created = unix_seconds();
     let (content_text, reasoning_text, tool_calls) = ir_assistant_to_openai_message(ir_resp);
@@ -1686,6 +1746,7 @@ pub fn ir_to_openai_downstream_response(ir_resp: &ChatResponse, model: &str) -> 
     Value::Object(obj)
 }
 
+/// Render an IR response as an OpenAI SSE stream body.
 pub fn ir_to_openai_downstream_stream(ir_resp: &ChatResponse, model: &str) -> String {
     let created = unix_seconds();
     let (content_text, reasoning_text, tool_calls) = ir_assistant_to_openai_message(ir_resp);
@@ -1776,6 +1837,7 @@ fn ir_assistant_to_openai_message(ir_resp: &ChatResponse) -> (String, String, Op
     )
 }
 
+/// Render an IR response as an Anthropic `/v1/messages` body.
 pub fn ir_to_anthropic_downstream_response(ir_resp: &ChatResponse, model: &str) -> Value {
     let (text, reasoning_text) = ir_assistant_text_and_reasoning(ir_resp);
 
@@ -1812,6 +1874,7 @@ pub fn ir_to_anthropic_downstream_response(ir_resp: &ChatResponse, model: &str) 
     Value::Object(obj)
 }
 
+/// Render an IR response as an Anthropic SSE stream body.
 pub fn ir_to_anthropic_downstream_stream(ir_resp: &ChatResponse, model: &str) -> String {
     let (text, reasoning_text) = ir_assistant_text_and_reasoning(ir_resp);
     let prompt_tokens = ir_resp.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0);
@@ -2002,6 +2065,7 @@ fn map_to_anthropic_stop_reason(reason: Option<&str>) -> String {
     }
 }
 
+/// Render an IR response as an Ollama `/api/chat` body.
 pub fn ir_to_ollama_downstream_response(ir_resp: &ChatResponse, model: &str) -> Value {
     let text = ir_resp
         .choices
@@ -2026,6 +2090,7 @@ pub fn ir_to_ollama_downstream_response(ir_resp: &ChatResponse, model: &str) -> 
     Value::Object(obj)
 }
 
+/// Render an IR response as an Ollama stream body.
 pub fn ir_to_ollama_downstream_stream(ir_resp: &ChatResponse, model: &str) -> String {
     let text = ir_resp
         .choices

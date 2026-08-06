@@ -1,3 +1,29 @@
+//! Local persistence for yallm: conversations, responses, monitor events.
+//!
+//! [`LocalStore`] is the single storage handle used by `yallm-server`. Two
+//! backends behind one interface:
+//! - **SQLite** (default): `YALLM_DB_URL=sqlite:///path/to/yallm.sqlite3`,
+//!   WAL mode, opened synchronously ([`LocalStore::open_database_url_sync`])
+//!   because it is constructed during server startup.
+//! - **Legacy JSON file**: `YALLM_STORAGE_PATH` (deprecated, warns).
+//!
+//! What is stored:
+//! - Responses & conversations (OpenAI Responses API objects as JSON, plus
+//!   the SSE event list for replay on `stream=true` GETs).
+//! - Context items (`resolve_context`) — the conversation history assembled
+//!   for a new response, keyed by conversation id or previous response id.
+//! - Monitor events — one row per proxied HTTP request, read by the
+//!   `/dashboard/api/events` endpoint; capped with `list_monitor_events`.
+//!
+//! Concurrency: SQLite connections are wrapped in a `Mutex` — safe to share
+//! across tasks, but writes serialize. WAL keeps readers non-blocking.
+//!
+//! Gotcha: opening the DB eagerly at state construction means tests must
+//! pass a unique `YALLM_DB_URL` (see `crates/yallm/tests/acp_roundtrip.rs`
+//! for the pid+counter temp-file pattern).
+
+#![warn(missing_docs)]
+
 use std::{
     collections::BTreeMap,
     fmt,
@@ -11,15 +37,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
 
+/// Deprecated legacy JSON-store env var; use [`DB_URL_ENV`].
 pub const STORAGE_PATH_ENV: &str = "YALLM_STORAGE_PATH";
+/// SQLite URL env var (`sqlite:///path/to/yallm.sqlite3`).
 pub const DB_URL_ENV: &str = "YALLM_DB_URL";
 const MAX_MONITOR_EVENTS: usize = 2_000;
 
 #[derive(Debug)]
+/// Storage failure kinds.
 pub enum StoreError {
+    /// Underlying I/O or SQLite error
     Io(std::io::Error),
+    /// Invalid argument or state
     Invalid(String),
+    /// Requested entity does not exist
     NotFound(String),
+    /// Constraint conflict (e.g. duplicate id)
     Conflict(String),
 }
 
@@ -48,37 +81,61 @@ impl From<serde_json::Error> for StoreError {
     }
 }
 
+/// Convenience alias for store operations.
 pub type StoreResult<T> = Result<T, StoreError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// List ordering.
 pub enum ListOrder {
+    /// Oldest first
     Asc,
+    /// Newest first
     Desc,
 }
 
 #[derive(Debug, Clone)]
+/// Cursor-paginated list result.
 pub struct ListPage<T> {
+    /// Items in this page
     pub data: Vec<T>,
+    /// Id of the first item (cursor)
     pub first_id: Option<String>,
+    /// Id of the last item (cursor)
     pub last_id: Option<String>,
+    /// Whether more items exist after this page
     pub has_more: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// One recorded HTTP request (dashboard data).
 pub struct MonitorEvent {
+    /// Server-assigned request id
     pub request_id: u64,
+    /// Unix milliseconds at completion
     pub timestamp_ms: u64,
+    /// HTTP method
     pub method: String,
+    /// Request path (with query)
     pub uri: String,
+    /// Normalized route pattern
     pub endpoint: String,
+    /// Response status
     pub status: u16,
+    /// Total handling time
     pub latency_ms: u64,
+    /// Request body size
     pub request_bytes: u64,
+    /// Response body size
     pub response_bytes: u64,
+    /// Upstream provider, when proxied
     pub provider: Option<String>,
+    /// Model as requested by the client
     pub model: Option<String>,
+    /// Model sent to the upstream
     pub upstream_model: Option<String>,
+    /// Upstream URL, when proxied
     pub upstream_url: Option<String>,
+    /// Whether the request was a stream
     pub stream: bool,
 }
 
@@ -116,24 +173,37 @@ impl SqliteStore {
 }
 
 #[derive(Debug, Clone)]
+/// Resolved conversation context for a new response.
 pub struct ContextItems {
+    /// Conversation the context came from, when any
     pub conversation_id: Option<String>,
+    /// Context items (history) to feed the model
     pub items: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
+/// Payload for [`LocalStore::save_response`].
 pub struct SaveResponseRequest {
+    /// The Responses API object to persist
     pub response: Value,
+    /// Input items of the request (for `/input_items`)
     pub request_input_items: Vec<Value>,
+    /// Conversation this response belongs to
     pub conversation_id: Option<String>,
+    /// Previous response id, when chained
     pub previous_response_id: Option<String>,
+    /// Provider that produced it
     pub provider: String,
+    /// SSE events for stream replay
     pub stream_events: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
+/// Result of saving a response.
 pub struct SavedResponse {
+    /// The stored response object
     pub response: Value,
+    /// Conversation id it was attached to
     pub conversation_id: Option<String>,
 }
 
@@ -191,6 +261,7 @@ impl Default for StoreFile {
 }
 
 #[derive(Clone)]
+/// Storage handle: conversations, responses, monitor events.
 pub struct LocalStore {
     backend: StoreBackend,
 }
@@ -223,12 +294,23 @@ impl fmt::Debug for LocalStore {
 }
 
 impl LocalStore {
+    /// Open the SQLite store synchronously (startup path). `None` = default
+    /// path (see [`default_db_url`]); `sqlite::memory:` for a throwaway store.
+    ///
+    /// ```
+    /// let store = yallm_storage::LocalStore::open_database_url_sync(
+    ///     Some("sqlite::memory:"),
+    /// )
+    /// .expect("in-memory store");
+    /// assert_eq!(store.location(), "sqlite::memory:");
+    /// ```
     pub fn open_database_url_sync(url: Option<&str>) -> StoreResult<Self> {
         Ok(Self {
             backend: StoreBackend::Sqlite(SqliteStore::open_sync(url)?),
         })
     }
 
+    /// Open the legacy JSON-file store synchronously (deprecated path).
     pub fn open_sync(path: Option<PathBuf>) -> StoreResult<Self> {
         let path = path.unwrap_or_else(default_storage_path);
         let data = load_store_file_sync(&path)?;
@@ -240,6 +322,7 @@ impl LocalStore {
         })
     }
 
+    /// Open the legacy JSON-file store asynchronously (deprecated path).
     pub async fn open(path: Option<PathBuf>) -> StoreResult<Self> {
         let path = path.unwrap_or_else(default_storage_path);
         let data = load_store_file(&path).await?;
@@ -251,6 +334,7 @@ impl LocalStore {
         })
     }
 
+    /// Backend location string (db path or JSON path).
     pub fn location(&self) -> &str {
         match &self.backend {
             StoreBackend::Json(store) => store.path.to_str().unwrap_or("<non-utf8-path>"),
@@ -258,6 +342,7 @@ impl LocalStore {
         }
     }
 
+    /// Create a conversation; returns the stored conversation object.
     pub async fn create_conversation(
         &self,
         metadata: Option<Value>,
@@ -287,6 +372,7 @@ impl LocalStore {
         .await
     }
 
+    /// Fetch a conversation by id.
     pub async fn get_conversation(&self, conversation_id: &str) -> StoreResult<Option<Value>> {
         let store = self.read_snapshot().await?;
         let Some(conv) = store.conversations.get(conversation_id) else {
@@ -298,6 +384,7 @@ impl LocalStore {
         Ok(Some(conversation_json(conv)))
     }
 
+    /// Update conversation metadata; `NotFound` when absent.
     pub async fn update_conversation(
         &self,
         conversation_id: &str,
@@ -316,6 +403,7 @@ impl LocalStore {
         .await
     }
 
+    /// Delete a conversation; returns the deleted object when present.
     pub async fn delete_conversation(&self, conversation_id: &str) -> StoreResult<Option<Value>> {
         self.apply_mutation(|store| {
             let Some(conv) = store.conversations.get_mut(conversation_id) else {
@@ -331,6 +419,7 @@ impl LocalStore {
         .await
     }
 
+    /// Append items to a conversation.
     pub async fn add_conversation_items(
         &self,
         conversation_id: &str,
@@ -349,6 +438,7 @@ impl LocalStore {
         .await
     }
 
+    /// List a conversation's items (paginated).
     pub async fn list_conversation_items(
         &self,
         conversation_id: &str,
@@ -376,6 +466,7 @@ impl LocalStore {
         Ok(Some(page))
     }
 
+    /// Fetch one item by id.
     pub async fn get_conversation_item(
         &self,
         conversation_id: &str,
@@ -400,6 +491,7 @@ impl LocalStore {
         Ok(Some(item.item.clone()))
     }
 
+    /// Delete one item by id.
     pub async fn delete_conversation_item(
         &self,
         conversation_id: &str,
@@ -424,6 +516,7 @@ impl LocalStore {
         .await
     }
 
+    /// Assemble the context for a new response: full conversation items, or the chain starting at `previous_response_id`.
     pub async fn resolve_context(
         &self,
         conversation_id: Option<&str>,
@@ -495,6 +588,7 @@ impl LocalStore {
         })
     }
 
+    /// Persist a response (and its SSE events); returns the stored object.
     pub async fn save_response(&self, req: SaveResponseRequest) -> StoreResult<SavedResponse> {
         self.apply_mutation(|store| {
             let mut response = req.response;
@@ -612,6 +706,7 @@ impl LocalStore {
         .await
     }
 
+    /// Fetch a stored response by id.
     pub async fn get_response(&self, response_id: &str) -> StoreResult<Option<Value>> {
         let store = self.read_snapshot().await?;
         let Some(resp) = store.responses.get(response_id) else {
@@ -623,6 +718,7 @@ impl LocalStore {
         Ok(Some(resp.response.clone()))
     }
 
+    /// Fetch the stored SSE events for a response (stream replay).
     pub async fn get_response_stream_events(
         &self,
         response_id: &str,
@@ -640,6 +736,7 @@ impl LocalStore {
         Ok(Some(resp.stream_events.clone()))
     }
 
+    /// Delete a response; returns the deleted object when present.
     pub async fn delete_response(&self, response_id: &str) -> StoreResult<Option<Value>> {
         self.apply_mutation(|store| {
             let Some(resp) = store.responses.get_mut(response_id) else {
@@ -655,6 +752,7 @@ impl LocalStore {
         .await
     }
 
+    /// Mark a response cancelled (status update).
     pub async fn cancel_response(&self, response_id: &str) -> StoreResult<Option<Value>> {
         self.apply_mutation(|store| {
             let Some(resp) = store.responses.get_mut(response_id) else {
@@ -668,6 +766,7 @@ impl LocalStore {
         .await
     }
 
+    /// List the stored input items of a response.
     pub async fn list_response_input_items(
         &self,
         response_id: &str,
@@ -692,6 +791,7 @@ impl LocalStore {
         Ok(Some(page))
     }
 
+    /// Persist one monitor event.
     pub async fn record_monitor_event(&self, event: MonitorEvent) -> StoreResult<()> {
         match &self.backend {
             StoreBackend::Json(_) => Ok(()),
@@ -708,6 +808,7 @@ impl LocalStore {
         }
     }
 
+    /// List monitor events, newest first, capped at `limit`.
     pub async fn list_monitor_events(&self, limit: usize) -> StoreResult<Vec<MonitorEvent>> {
         match &self.backend {
             StoreBackend::Json(_) => Ok(Vec::new()),
@@ -722,6 +823,7 @@ impl LocalStore {
         }
     }
 
+    /// Delete all monitor events; returns how many were removed.
     pub async fn clear_monitor_events(&self) -> StoreResult<usize> {
         match &self.backend {
             StoreBackend::Json(_) => Ok(0),
@@ -1569,6 +1671,7 @@ async fn persist_store_file(path: &Path, store: &StoreFile) -> StoreResult<()> {
     Ok(())
 }
 
+/// Default legacy JSON store path (cache dir or temp dir).
 pub fn default_storage_path() -> PathBuf {
     if let Ok(path) = std::env::var(STORAGE_PATH_ENV)
         && !path.is_empty()
@@ -1583,6 +1686,7 @@ pub fn default_storage_path() -> PathBuf {
     std::env::temp_dir().join("yallm").join("storage.json")
 }
 
+/// Default SQLite URL: `<cache-dir>/yallm/storage.sqlite3` (temp dir fallback).
 pub fn default_db_url() -> String {
     let path = if let Some(cache_dir) = dirs::cache_dir() {
         cache_dir.join("yallm").join("storage.sqlite3")

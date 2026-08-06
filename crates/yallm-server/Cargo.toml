@@ -38,3 +38,6 @@ criterion = "0.5"
 [[bench]]
 name = "proxy_perf"
 harness = false
+
+[lints]
+workspace = true

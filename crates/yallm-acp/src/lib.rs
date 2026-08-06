@@ -1,3 +1,32 @@
+//! ACP bridge: connect yallm to Agent Client Protocol agents, both ways.
+//!
+//! Two directions, mirror images:
+//!
+//! **yallm as ACP client** (upstream — `acp:` provider): `complete_with_agent`
+//! / `complete_with_command` run one prompt turn against an ACP agent
+//! (stdio subprocess per the command string, e.g.
+//! `"npx -y @agentclientprotocol/codex-acp"`) and return the assistant text as
+//! a yallm IR [`ChatResponse`]; `stream_with_agent` / `stream_with_command`
+//! yield [`AcpStreamEvent`]s (`TextDelta`… `Stop`) instead. Used by
+//! `yallm-server` `call_acp` / `call_acp_stream`.
+//!
+//! **yallm as ACP agent** (downstream — `yallm acp` subcommand):
+//! [`agent_for_backend`] wraps any IR backend closure in an ACP agent
+//! (handles `initialize` / `new_session` / `prompt`, streams the assistant
+//! text as `AgentMessageChunk` notifications), and [`serve_stdio`] attaches
+//! that agent to stdin/stdout. Wire format is newline-delimited JSON-RPC;
+//! anything the agent writes to stdout must be protocol, so the binary
+//! routes logs to stderr in ACP mode.
+//!
+//! Conversion helpers: [`ir_to_prompt`] (IR → ACP content blocks, a single
+//! user message stays bare, multi-turn chats become a `Role: text` transcript)
+//! and [`session_update_text`] (extract assistant text from a session update).
+//!
+//! Errors are `agent_client_protocol::Error`; use [`internal_error`] to build
+//! them for backend failures.
+
+#![warn(missing_docs)]
+
 use std::{
     future::Future,
     path::PathBuf,
@@ -21,15 +50,41 @@ use futures::Stream;
 use tokio::sync::{Mutex, mpsc};
 use yallm_ir::{ChatRequest, ChatResponse, Choice, Content, Message, Role};
 
+/// One step of an ACP streaming turn, normalized for yallm's stream pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcpStreamEvent {
+    /// Assistant text chunk
     TextDelta(String),
-    Stop { finish_reason: String },
+    /// Turn finished; `finish_reason` matches yallm's IR finish reasons
+    Stop {
+        /// Why the turn ended (`stop`, `length`, ...)
+        finish_reason: String,
+    },
 }
 
+/// Streaming turn: `TextDelta` events, then exactly one `Stop`, then EOF.
 pub type AcpEventStream =
     Pin<Box<dyn Stream<Item = Result<AcpStreamEvent, String>> + Send + 'static>>;
 
+/// Convert an IR chat request into ACP prompt content blocks. A single user
+/// message stays bare text; multi-message chats become a `Role: text`
+/// transcript joined with blank lines.
+///
+/// ```
+/// use yallm_ir::{ChatRequest, Message, Role};
+///
+/// let request = ChatRequest {
+///     model: "acp:codex".to_string(),
+///     messages: vec![Message::text(Role::User, "Hello")],
+///     max_tokens: None,
+///     temperature: None,
+///     top_p: None,
+///     stream: false,
+/// };
+///
+/// let blocks = yallm_acp::ir_to_prompt(&request);
+/// assert_eq!(blocks.len(), 1);
+/// ```
 pub fn ir_to_prompt(request: &ChatRequest) -> Vec<ContentBlock> {
     let text = if request.messages.len() == 1 && request.messages[0].role == Role::User {
         message_text(&request.messages[0])
@@ -45,6 +100,8 @@ pub fn ir_to_prompt(request: &ChatRequest) -> Vec<ContentBlock> {
     vec![ContentBlock::Text(TextContent::new(text))]
 }
 
+/// Extract assistant text from a session update; returns `None` for any
+/// other update kind (thoughts, tool calls, ...).
 pub fn session_update_text(update: &SessionUpdate) -> Option<String> {
     match update {
         SessionUpdate::AgentMessageChunk(ContentChunk {
@@ -55,6 +112,9 @@ pub fn session_update_text(update: &SessionUpdate) -> Option<String> {
     }
 }
 
+/// Run one prompt turn against an in-process ACP agent connection and return
+/// the assistant reply as an IR [`ChatResponse`] (accumulated from
+/// `AgentMessageChunk` notifications).
 pub async fn complete_with_agent<A>(
     agent: A,
     cwd: impl Into<PathBuf>,
@@ -109,6 +169,9 @@ where
     ))
 }
 
+/// [`complete_with_agent`] for a subprocess: spawn `command` (shell string or
+/// JSON stdio spec) and speak ACP to it over stdio. This is what
+/// `yallm-server`'s `acp:` provider calls.
 pub async fn complete_with_command(
     command: &str,
     cwd: impl Into<PathBuf>,
@@ -118,6 +181,9 @@ pub async fn complete_with_command(
     complete_with_agent(agent, cwd, request).await
 }
 
+/// [`complete_with_agent`] as a stream: yields [`AcpStreamEvent`]s as the
+/// agent pushes updates, ending with `Stop`. The turn runs in a spawned task;
+/// the returned stream is cancel-safe.
 pub fn stream_with_agent<A>(
     agent: A,
     cwd: impl Into<PathBuf>,
@@ -185,6 +251,7 @@ where
     }))
 }
 
+/// [`stream_with_agent`] for a subprocess (see [`complete_with_command`]).
 pub fn stream_with_command(
     command: &str,
     cwd: impl Into<PathBuf>,
@@ -194,6 +261,11 @@ pub fn stream_with_command(
     Ok(stream_with_agent(agent, cwd, request))
 }
 
+/// Wrap an IR backend closure in an ACP agent: handles `initialize` /
+/// `new_session` / `prompt`, converts prompts via `prompt_to_ir` (a single
+/// user message with `default_model`), streams the assistant text back as
+/// `AgentMessageChunk` notifications, and maps the backend's finish reason
+/// to an ACP stop reason.
 pub fn agent_for_backend<B, Fut>(
     default_model: impl Into<String>,
     backend: B,
@@ -253,6 +325,8 @@ where
         )
 }
 
+/// Serve the [`agent_for_backend`] agent on stdin/stdout — the `yallm acp`
+/// subcommand's body. Only ACP protocol bytes may go to stdout.
 pub async fn serve_stdio<B, Fut>(
     default_model: impl Into<String>,
     backend: B,
@@ -266,6 +340,8 @@ where
         .await
 }
 
+/// Build a protocol-level `internal_error` (surfaced to the ACP peer as a
+/// JSON-RPC error) for backend failures.
 pub fn internal_error(message: impl Into<String>) -> agent_client_protocol::Error {
     agent_client_protocol::util::internal_error(message.into())
 }

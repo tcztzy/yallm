@@ -13,3 +13,6 @@ agent-client-protocol = "0.14.0"
 futures.workspace = true
 tokio.workspace = true
 yallm-ir.workspace = true
+
+[lints]
+workspace = true

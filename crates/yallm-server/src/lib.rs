@@ -1,7 +1,24 @@
-//! yallm-server: HTTP server for LLM API conversion proxy
+//! yallm-server: the HTTP server that proxies and converts LLM APIs.
 //!
-//! This crate provides an axum-based HTTP server that proxies and converts
-//! between different LLM API formats (OpenAI, Anthropic, Ollama).
+//! axum-based. Entry points:
+//! - [`app()`] / [`app_with_state(state)`](app_with_state) — the router.
+//!   Route table: OpenAI `/v1/chat/completions`, `/v1/models`; Anthropic
+//!   `/v1/messages`; Ollama `/api/chat`; Responses/Conversations
+//!   `/v1/responses*`, `/v1/conversations*`; monitoring `/dashboard*`;
+//!   `/health`, `/` (info). All routes sit behind the `logging::log_http`
+//!   middleware (request ids, JSON logs, monitor events) and a permissive
+//!   CORS layer.
+//! - [`run(config)`](run) — bind + serve with optional TLS (rustls; partial
+//!   TLS config is rejected), constructing `AppState` from the environment.
+//! - [`ServerConfig`] — addr, TLS paths, LiteLLM config path.
+//!
+//! Modules: `proxy` (routing + upstream calls), `proxy::stream`
+//! (stream translation), `state` (config/transport), `responses_routes`
+//! (Responses/Conversations API), `logging` (middleware), `dashboard`
+//! (monitoring UI), `tls` (acceptor), `routes` (chat/messages/models).
+//! Everything public is re-exported at the crate root.
+
+#![warn(missing_docs)]
 
 use axum::{
     Router,
@@ -30,9 +47,13 @@ pub use tls::*;
 /// Server configuration
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    /// Bind address (host:port)
     pub addr: SocketAddr,
+    /// PEM certificate path; must be set together with `tls_key`
     pub tls_cert: Option<String>,
+    /// PEM private key path; must be set together with `tls_cert`
     pub tls_key: Option<String>,
+    /// Optional LiteLLM config.yaml path (loaded by `yallm-config`)
     pub litellm_config: Option<PathBuf>,
 }
 
@@ -48,6 +69,8 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    /// True when both cert and key are present (partial config is rejected
+    /// by [`run`]).
     pub fn tls_enabled(&self) -> bool {
         self.tls_cert.is_some() && self.tls_key.is_some()
     }

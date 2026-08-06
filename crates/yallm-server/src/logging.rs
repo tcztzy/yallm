@@ -1,3 +1,22 @@
+//! Request logging middleware + monitoring event recording.
+//!
+//! [`log_http`] wraps every route: it assigns a [`RequestId`] (injected as
+//! an axum `Extension` for handlers, e.g. `responses_routes`), captures the
+//! request body (bounded by `YALLM_LOG_BODY_MAX_BYTES`, base64-encoded when
+//! not UTF-8), and on completion emits a JSON `tracing::info` record
+//! (event = `http.request`) plus a monitor event persisted to the store —
+//! the data behind `/dashboard/api/events`.
+//!
+//! Secrets: `authorization` / `x-api-key` / `api-key` / `proxy-authorization`
+//! headers are always redacted (`[REDACTED]`) in logs; body payloads are
+//! passed through [`redact_json_secrets`] (keys like `api_key`, `Authorization`)
+//! when `YALLM_LOG_REDACT_SECRETS=true` (the default). Keep the header list
+//! in sync with `redact_headers` in `crate::proxy`.
+//!
+//! Gotcha: bodies and headers are logged verbatim for unredacted keys — do
+//! not raise `YALLM_LOG_BODY_MAX_BYTES` on shared infra without auditing
+//! what clients may send.
+
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -11,6 +30,9 @@ use serde_json::json;
 
 use crate::{proxy::choose_provider, state::AppState};
 
+/// Per-request id assigned by the logging middleware; injected into handlers
+/// as an axum `Extension` (e.g. `responses_routes` reads it to correlate
+/// stored responses with monitor events).
 #[derive(Debug, Clone, Copy)]
 pub struct RequestId(pub u64);
 
@@ -108,6 +130,9 @@ fn body_to_log(bytes: &Bytes, max_bytes: usize) -> BodyLog {
     }
 }
 
+/// axum middleware: assign a [`RequestId`], snapshot the request body
+/// (bounded, redacted), run the inner handler, then emit a JSON log record
+/// and persist a monitor event for the dashboard.
 pub async fn log_http(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let request_id = state.next_request_id();
     let started = Instant::now();
@@ -295,6 +320,8 @@ fn unix_millis() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Recursively replace secret-looking keys (`authorization`, `api_key`,
+/// `token`, `access_token`, `x-api-key`, `apikey`) with `[REDACTED]`.
 pub fn redact_json_secrets(value: &serde_json::Value) -> serde_json::Value {
     fn go(v: &serde_json::Value) -> serde_json::Value {
         match v {

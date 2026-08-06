@@ -2,6 +2,13 @@
 members = ["crates/*"]
 resolver = "2"
 
+# Inherited by every crate via `[lints] workspace = true`.
+# These rustdoc lints only fire during `cargo doc`, not `cargo build`/clippy —
+# run `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` to check.
+[workspace.lints.rustdoc]
+broken-intra-doc-links = "warn"
+missing-crate-level-docs = "warn"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"

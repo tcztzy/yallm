@@ -2,7 +2,7 @@
 # See https://pre-commit.com/hooks.html for more hooks
 repos:
 -   repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v3.2.0
+    rev: v6.0.0
     hooks:
     -   id: trailing-whitespace
     -   id: end-of-file-fixer
@@ -16,6 +16,24 @@ repos:
     -   id: ruff-format
 -   repo: local
     hooks:
+    -   id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt -- --check
+        language: system
+        pass_filenames: false
+        files: \.(rs|toml)$
+    -   id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets -- -D warnings
+        language: system
+        pass_filenames: false
+        files: \.(rs|toml)$
+    -   id: cargo-doc
+        name: cargo doc (rustdoc lints)
+        entry: env RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --no-deps
+        language: system
+        pass_filenames: false
+        files: \.(rs|toml)$
     -   id: pytest
         name: pytest
         entry: uv run pytest
