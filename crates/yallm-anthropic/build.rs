@@ -15,8 +15,15 @@ fn main() {
     println!("cargo:rerun-if-changed=openapi.yml");
 
     // IMPORTANT: build scripts should not mutate tracked files by default.
-    // Opt in explicitly when updating the vendored OpenAPI spec.
-    if std::env::var_os("YALLM_UPDATE_ANTHROPIC_OPENAPI").is_none() {
+    // Opt in explicitly when updating the vendored OpenAPI spec. Only "1"
+    // (or any non-"0" value) opts in — unset AND "0" both mean off. The CI
+    // offline job pins the vendored spec with YALLM_UPDATE_ANTHROPIC_OPENAPI=0,
+    // so treating "0" as a refresh trigger would overwrite it with the
+    // live spec on every fresh checkout and break deterministic builds.
+    if std::env::var_os("YALLM_UPDATE_ANTHROPIC_OPENAPI")
+        .filter(|v| v != "0")
+        .is_none()
+    {
         return;
     }
 
