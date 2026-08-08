@@ -1698,14 +1698,19 @@ pub fn default_db_url() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
 
+    // pid + seq instead of clock: SystemTime has µs granularity on macOS, so
+    // parallel tests can compute the same timestamp and collide on one file.
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
     fn temp_path(name: &str) -> PathBuf {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!("yallm-storage-{name}-{ts}.json"))
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "yallm-storage-{name}-{}-{seq}.json",
+            std::process::id()
+        ))
     }
 
     #[tokio::test]

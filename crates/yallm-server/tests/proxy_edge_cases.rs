@@ -1,8 +1,10 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use axum::{
@@ -101,12 +103,16 @@ fn state_with_temp_store(name: &str) -> yallm_server::AppState {
     })
 }
 
+// pid + seq instead of clock: SystemTime has µs granularity on macOS, so
+// parallel tests can compute the same timestamp and collide on one sqlite
+// file (one open wins the schema lock, the other gets SQLITE_BUSY).
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 fn temp_store_path(name: &str) -> PathBuf {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    std::env::temp_dir().join(format!("yallm-proxy-edge-test-{name}-{ts}.json"))
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "yallm-proxy-edge-test-{name}-{}-{seq}.json",
+        std::process::id()
+    ))
 }
 
 fn temp_db_url(name: &str) -> String {
