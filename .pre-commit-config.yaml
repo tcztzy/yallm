@@ -1,5 +1,8 @@
 # See https://pre-commit.com for more information
 # See https://pre-commit.com/hooks.html for more hooks
+# Vendored OpenAPI specs are generated artifacts (large, machine-written);
+# skip whitespace/size linting for them.
+exclude: 'crates/yallm-(openai|anthropic)/openapi(\.documented)?\.yml$'
 repos:
 -   repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0

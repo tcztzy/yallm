@@ -9,6 +9,10 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    // The proc macro reads the vendored spec at expansion time; cargo cannot
+    // see that dependency, so declare it or spec updates silently keep the
+    // stale cached codegen.
+    println!("cargo:rerun-if-changed=openapi.yml");
 
     // IMPORTANT: build scripts should not mutate tracked files by default.
     // Opt in explicitly when updating the vendored OpenAPI spec.

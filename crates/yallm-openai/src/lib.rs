@@ -250,6 +250,7 @@ fn content_to_user(msg: &Message) -> ChatCompletionRequestUserMessageContent {
                 ChatCompletionRequestMessageContentPartText {
                     text: t.text.clone(),
                     type_: ChatCompletionRequestMessageContentPartTextType::Text,
+                    prompt_cache_breakpoint: None,
                 },
             )),
             Content::Image(ic) => {
@@ -266,6 +267,7 @@ fn content_to_user(msg: &Message) -> ChatCompletionRequestUserMessageContent {
                                 ChatCompletionRequestMessageContentPartImageImageUrlDetail::Auto,
                         },
                         type_: ChatCompletionRequestMessageContentPartImageType::ImageUrl,
+                        prompt_cache_breakpoint: None,
                     },
                 ))
             }
