@@ -57,6 +57,5 @@ reader more tokens than no doc.
   fire during `cargo doc`, never during `cargo build`/`clippy`. If you add
   or move doc links, verify with
   `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`.
-- Known: the `pytest` and `ty` hooks currently fail on the python side
-  (pytest missing from the root venv; ty diagnostics in `python/yallm`) —
-  the Rust hooks are the gate that matters for Rust changes.
+- All hooks (Rust fmt/clippy/doc, ruff, pytest, ty) pass on the current
+  tree; if a hook fails for an unrelated change, fix it before committing.
